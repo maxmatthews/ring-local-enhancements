@@ -1,0 +1,17 @@
+{
+  "name": "ring-door-snooze",
+  "version": "1.0.0",
+  "description": "Snooze Ring camera motion alerts when a door sensor opens",
+  "type": "module",
+  "main": "index.mjs",
+  "scripts": {
+    "start": "node index.mjs",
+    "auth": "npx -p ring-client-api ring-auth-cli"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "dependencies": {
+    "ring-client-api": "^14.3.0"
+  }
+}

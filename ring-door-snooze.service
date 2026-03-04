@@ -1,0 +1,26 @@
+[Unit]
+Description=Ring Door Sensor Camera Snooze Automation
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=odroid
+WorkingDirectory=/home/odroid/ring-door-snooze
+ExecStart=/home/odroid/.nvm/versions/node/v22.13.1/bin/node index.mjs
+Restart=always
+RestartSec=30
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=ring-door-snooze
+
+# Hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/odroid/ring-door-snooze
+
+[Install]
+WantedBy=multi-user.target
