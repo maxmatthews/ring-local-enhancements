@@ -1,0 +1,5 @@
+{
+  "_comment": "Map of Dirigera blind name -> Ring contact sensor name. Both sides match case-insensitively and use partial substring matching (same as DOOR_SENSOR_NAME). Copy to blind-sensor-map.json and edit. Blinds not listed here always close at sunset.",
+  "Living Room Blind": "Front Door",
+  "Kitchen Blind": "Back Door"
+}

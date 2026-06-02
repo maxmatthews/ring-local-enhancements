@@ -1,17 +1,20 @@
 {
   "name": "ring-door-snooze",
-  "version": "1.0.0",
-  "description": "Snooze Ring camera motion alerts when a door sensor opens",
+  "version": "1.1.0",
+  "description": "Snooze Ring camera motion alerts when a door opens, and gate Dirigera blind sunset-close on door state",
   "type": "module",
   "main": "index.mjs",
   "scripts": {
     "start": "node index.mjs",
-    "auth": "npx -p ring-client-api ring-auth-cli"
+    "auth": "npx -p ring-client-api ring-auth-cli",
+    "pair-dirigera": "npx dirigera authenticate"
   },
   "engines": {
     "node": ">=20.0.0"
   },
   "dependencies": {
-    "ring-client-api": "^14.3.0"
+    "dirigera": "^1.8.1",
+    "ring-client-api": "^14.3.0",
+    "suncalc": "^1.9.0"
   }
 }

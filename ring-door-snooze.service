@@ -5,9 +5,9 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=odroid
-WorkingDirectory=/home/odroid/ring-door-snooze
-ExecStart=/home/odroid/.nvm/versions/node/v22.13.1/bin/node index.mjs
+User=pi
+WorkingDirectory=/home/pi/ring-door-snooze
+ExecStart=/home/pi/.nvm/versions/node/v24.14.1/bin/node index.mjs
 Restart=always
 RestartSec=30
 
@@ -20,7 +20,7 @@ SyslogIdentifier=ring-door-snooze
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=read-only
-ReadWritePaths=/home/odroid/ring-door-snooze
+ReadWritePaths=/home/pi/ring-door-snooze
 
 [Install]
 WantedBy=multi-user.target

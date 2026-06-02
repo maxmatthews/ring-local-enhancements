@@ -1,11 +1,21 @@
 /**
- * Ring Door Sensor -> Camera Smart Alert Snooze
+ * Ring + Dirigera home automation glue.
  *
- * Temporarily disables "Person Detected" push notifications 
- * when a door is opened, while keeping video recording active.
+ *   1. Snoozes "Person Detected" notifications on a Ring camera when a
+ *      designated door contact sensor opens (original behavior).
+ *   2. Closes IKEA Dirigera blinds at sunset, but defers closing any blind
+ *      whose mapped contact sensor reports open -- the blind closes
+ *      POST_CLOSE_DELAY_SECONDS after the sensor transitions back to closed.
+ *      Blinds with no mapping always close.
+ *
+ * The Dirigera hub has no native Ring integration; the sunset trigger lives
+ * here. Disable the equivalent scene in the IKEA Home Smart app so the two
+ * don't race.
  */
 
 import { RingApi, RingDeviceType } from "ring-client-api";
+import { createDirigeraClient } from "dirigera";
+import SunCalc from "suncalc";
 import { readFileSync, writeFileSync, existsSync } from "fs";
 import { resolve, dirname } from "path";
 import { fileURLToPath } from "url";
@@ -13,7 +23,7 @@ import { fileURLToPath } from "url";
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
 // ---------------------------------------------------------------------------
-// Env Setup
+// Env
 // ---------------------------------------------------------------------------
 
 function loadEnv() {
@@ -44,10 +54,20 @@ const CAMERA_NAME = (process.env.CAMERA_NAME || "Front Door").toLowerCase();
 const SNOOZE_MINUTES = parseInt(process.env.SNOOZE_MINUTES || "30", 10);
 const COOLDOWN_SECONDS = parseInt(process.env.COOLDOWN_SECONDS || "60", 10);
 
+const DIRIGERA_HOST = process.env.DIRIGERA_HOST;
+const DIRIGERA_TOKEN = process.env.DIRIGERA_TOKEN;
+const LATITUDE = parseFloat(process.env.LATITUDE || "");
+const LONGITUDE = parseFloat(process.env.LONGITUDE || "");
+const BLIND_SENSOR_MAP_FILE = process.env.BLIND_SENSOR_MAP_FILE || "blind-sensor-map.json";
+const POST_CLOSE_DELAY_SECONDS = parseInt(process.env.POST_CLOSE_DELAY_SECONDS || "60", 10);
+const BLIND_CLOSED_LEVEL = 100;
+
 if (!REFRESH_TOKEN) {
   console.error("RING_REFRESH_TOKEN is required.");
   process.exit(1);
 }
+
+const blindsEnabled = !!(DIRIGERA_HOST && DIRIGERA_TOKEN && Number.isFinite(LATITUDE) && Number.isFinite(LONGITUDE));
 
 function log(msg) {
   console.log(`[${new Date().toISOString()}] ${msg}`);
@@ -57,11 +77,66 @@ function logError(msg, err) {
 }
 
 // ---------------------------------------------------------------------------
-// Smart Alert Toggle Logic
+// Blind <-> sensor mapping
 // ---------------------------------------------------------------------------
 
-// Keep track of timers so we don't overlap if the door opens multiple times
+function loadBlindSensorMap() {
+  const mapPath = resolve(__dirname, BLIND_SENSOR_MAP_FILE);
+  if (!existsSync(mapPath)) {
+    log(`No mapping file at ${mapPath} -- all blinds will close unconditionally at sunset.`);
+    return {};
+  }
+  try {
+    const raw = JSON.parse(readFileSync(mapPath, "utf-8"));
+    const cleaned = {};
+    for (const [k, v] of Object.entries(raw)) {
+      if (k.startsWith("_") || typeof v !== "string") continue;
+      cleaned[k] = v;
+    }
+    return cleaned;
+  } catch (err) {
+    logError(`Failed to read ${BLIND_SENSOR_MAP_FILE}, treating as empty`, err);
+    return {};
+  }
+}
+
+const blindMap = blindsEnabled ? loadBlindSensorMap() : {};
+
+function nameMatches(realName, partialKey) {
+  return realName.toLowerCase().includes(partialKey.toLowerCase());
+}
+
+function findSensorKeyForBlind(blindName) {
+  for (const [blindKey, sensorKey] of Object.entries(blindMap)) {
+    if (nameMatches(blindName, blindKey)) return sensorKey;
+  }
+  return null;
+}
+
+// ---------------------------------------------------------------------------
+// Sensor state + pending blind closes
+// ---------------------------------------------------------------------------
+
+// sensorId -> { name, isOpen }
+const sensorState = new Map();
+
+// blindId -> { blindName, sensorId, sensorName, timer }
+const pendingCloses = new Map();
+
+function isSensorOpen(sensorId) {
+  return !!sensorState.get(sensorId)?.isOpen;
+}
+
+function findSensorByKey(sensors, partialKey) {
+  return sensors.find((s) => nameMatches(s.name, partialKey));
+}
+
+// ---------------------------------------------------------------------------
+// Camera snooze (original feature)
+// ---------------------------------------------------------------------------
+
 const activeReenableTimers = {};
+let lastSnoozeTime = 0;
 
 async function snoozeCamera(ringApi, camera, minutes) {
   const deviceUrl = `https://api.ring.com/devices/v1/devices/${camera.id}/settings`;
@@ -69,30 +144,21 @@ async function snoozeCamera(ringApi, camera, minutes) {
   log(`>>> Disabling Person notifications on "${camera.name}" for ${minutes} min...`);
 
   try {
-    // 1. Turn OFF the human notification
     await ringApi.restClient.request({
       url: deviceUrl,
       method: "PATCH",
       json: {
         cv_settings: {
           detection_types: {
-            human: {
-              enabled: true,
-              mode: "edge",
-              notification: false // <-- The magic toggle
-            }
-          }
-        }
+            human: { enabled: true, mode: "edge", notification: false },
+          },
+        },
       },
     });
     log(">>> Person notification DISABLED (Recording is still active).");
 
-    // Clear any existing timer for this specific camera
-    if (activeReenableTimers[camera.id]) {
-      clearTimeout(activeReenableTimers[camera.id]);
-    }
+    if (activeReenableTimers[camera.id]) clearTimeout(activeReenableTimers[camera.id]);
 
-    // 2. Schedule re-enable
     activeReenableTimers[camera.id] = setTimeout(async () => {
       log(`>>> ${minutes} min passed. Re-enabling Person notifications for "${camera.name}"...`);
       try {
@@ -102,13 +168,9 @@ async function snoozeCamera(ringApi, camera, minutes) {
           json: {
             cv_settings: {
               detection_types: {
-                human: {
-                  enabled: true,
-                  mode: "edge",
-                  notification: true // <-- Turn it back on
-                }
-              }
-            }
+                human: { enabled: true, mode: "edge", notification: true },
+              },
+            },
           },
         });
         log(">>> Person notifications RE-ENABLED.");
@@ -118,35 +180,200 @@ async function snoozeCamera(ringApi, camera, minutes) {
         delete activeReenableTimers[camera.id];
       }
     }, minutes * 60 * 1000);
-
   } catch (err) {
     logError("Failed to disable Person notifications", err);
   }
 }
 
+function maybeSnooze(ringApi, targetCamera) {
+  const now = Date.now();
+  const elapsed = (now - lastSnoozeTime) / 1000;
+  if (elapsed < COOLDOWN_SECONDS) {
+    log(`Snooze trigger -- cooldown active (${Math.round(elapsed)}s/${COOLDOWN_SECONDS}s)`);
+    return;
+  }
+  log(`>>> DOOR OPENED -- snoozing camera`);
+  lastSnoozeTime = now;
+  snoozeCamera(ringApi, targetCamera, SNOOZE_MINUTES);
+}
+
 // ---------------------------------------------------------------------------
-// Main Logic
+// Dirigera blind control
+// ---------------------------------------------------------------------------
+
+let dirigera = null;
+
+async function connectDirigera() {
+  log(`Connecting to Dirigera hub at ${DIRIGERA_HOST}...`);
+  dirigera = await createDirigeraClient({
+    accessToken: DIRIGERA_TOKEN,
+    gatewayIP: DIRIGERA_HOST,
+  });
+  const blinds = await dirigera.blinds.list();
+  log(`Dirigera connected. ${blinds.length} blind(s): ${blinds.map((b) => b.attributes?.customName || b.id).join(", ")}`);
+  return blinds;
+}
+
+async function closeBlind(blindId, blindName) {
+  try {
+    await dirigera.blinds.setTargetLevel({ id: blindId, blindsTargetLevel: BLIND_CLOSED_LEVEL });
+    log(`Closed blind "${blindName}"`);
+  } catch (err) {
+    logError(`Failed to close blind "${blindName}"`, err);
+  }
+}
+
+async function onSunset(sensors) {
+  log(">>> SUNSET -- evaluating blinds");
+
+  // Stale pending closes from a previous evening get cleared; we re-evaluate fresh.
+  for (const pending of pendingCloses.values()) {
+    if (pending.timer) clearTimeout(pending.timer);
+  }
+  pendingCloses.clear();
+
+  let blinds;
+  try {
+    blinds = await dirigera.blinds.list();
+  } catch (err) {
+    logError("Failed to list blinds from Dirigera", err);
+    return;
+  }
+
+  for (const blind of blinds) {
+    const blindName = blind.attributes?.customName || blind.id;
+    const sensorKey = findSensorKeyForBlind(blindName);
+
+    if (!sensorKey) {
+      log(`"${blindName}": no sensor mapping, closing now`);
+      await closeBlind(blind.id, blindName);
+      continue;
+    }
+
+    const sensor = findSensorByKey(sensors, sensorKey);
+    if (!sensor) {
+      log(`WARN: mapped sensor "${sensorKey}" not found for blind "${blindName}", closing anyway`);
+      await closeBlind(blind.id, blindName);
+      continue;
+    }
+
+    if (isSensorOpen(sensor.id)) {
+      log(`Deferring "${blindName}" -- sensor "${sensor.name}" is open`);
+      pendingCloses.set(blind.id, {
+        blindName,
+        sensorId: sensor.id,
+        sensorName: sensor.name,
+        timer: null,
+      });
+    } else {
+      log(`"${blindName}": sensor "${sensor.name}" is closed, closing blind now`);
+      await closeBlind(blind.id, blindName);
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Sunset scheduling
+// ---------------------------------------------------------------------------
+
+function computeNextSunset() {
+  const now = new Date();
+  const today = SunCalc.getTimes(now, LATITUDE, LONGITUDE).sunset;
+  if (today > now) return today;
+  const tomorrow = new Date(now.getTime() + 24 * 60 * 60 * 1000);
+  return SunCalc.getTimes(tomorrow, LATITUDE, LONGITUDE).sunset;
+}
+
+function scheduleSunset(sensors) {
+  const next = computeNextSunset();
+  const delayMs = next.getTime() - Date.now();
+  log(`Next sunset: ${next.toISOString()} (in ${Math.round(delayMs / 60000)}min)`);
+  setTimeout(async () => {
+    try {
+      await onSunset(sensors);
+    } catch (err) {
+      logError("Sunset handler failed", err);
+    }
+    scheduleSunset(sensors);
+  }, delayMs);
+}
+
+// ---------------------------------------------------------------------------
+// Sensor subscription + transition dispatch
+// ---------------------------------------------------------------------------
+
+function onSensorTransition(sensor, nowOpen) {
+  if (nowOpen) {
+    // If the door reopens during the post-close grace window, cancel the close.
+    for (const pending of pendingCloses.values()) {
+      if (pending.sensorId === sensor.id && pending.timer) {
+        clearTimeout(pending.timer);
+        pending.timer = null;
+        log(`"${sensor.name}" reopened -- cancelling close timer for "${pending.blindName}"`);
+      }
+    }
+    return;
+  }
+
+  // Sensor just closed. Start the grace timer for any blinds waiting on it.
+  for (const [blindId, pending] of pendingCloses) {
+    if (pending.sensorId !== sensor.id || pending.timer) continue;
+    log(`"${sensor.name}" closed -- closing "${pending.blindName}" in ${POST_CLOSE_DELAY_SECONDS}s`);
+    pending.timer = setTimeout(async () => {
+      await closeBlind(blindId, pending.blindName);
+      pendingCloses.delete(blindId);
+    }, POST_CLOSE_DELAY_SECONDS * 1000);
+  }
+}
+
+function subscribeSensors(sensors, ringApi, targetCamera) {
+  for (const sensor of sensors) {
+    sensorState.set(sensor.id, { name: sensor.name, isOpen: !!sensor.data.faulted });
+    log(`Watching: "${sensor.name}" (open=${!!sensor.data.faulted})`);
+
+    sensor.onData.subscribe((data) => {
+      const prev = sensorState.get(sensor.id);
+      const nowOpen = !!data.faulted;
+      sensorState.set(sensor.id, { name: sensor.name, isOpen: nowOpen });
+
+      if (prev?.isOpen === nowOpen) return;
+
+      log(`Sensor "${sensor.name}" -> ${nowOpen ? "OPEN" : "CLOSED"}`);
+
+      if (nowOpen && nameMatches(sensor.name, SENSOR_NAME)) {
+        maybeSnooze(ringApi, targetCamera);
+      }
+
+      onSensorTransition(sensor, nowOpen);
+    });
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Main
 // ---------------------------------------------------------------------------
 
 async function main() {
-  log("Ring Door Sensor -> Camera Smart Alert Snooze");
-  log(`  Sensor: "${SENSOR_NAME}" | Camera: "${CAMERA_NAME}"`);
-  log(`  Snooze: ${SNOOZE_MINUTES}min | Cooldown: ${COOLDOWN_SECONDS}s`);
+  log("Ring door snooze + Dirigera sunset gate");
+  log(`  Snooze sensor: "${SENSOR_NAME}" -> camera: "${CAMERA_NAME}" (${SNOOZE_MINUTES}min, ${COOLDOWN_SECONDS}s cooldown)`);
+  if (blindsEnabled) {
+    log(`  Dirigera: ${DIRIGERA_HOST} | lat,lon: ${LATITUDE},${LONGITUDE} | post-close delay: ${POST_CLOSE_DELAY_SECONDS}s`);
+    log(`  Blind mapping: ${Object.keys(blindMap).length ? JSON.stringify(blindMap) : "(none)"}`);
+  } else {
+    log("  Dirigera disabled (missing DIRIGERA_HOST / DIRIGERA_TOKEN / LATITUDE / LONGITUDE)");
+  }
 
   const ringApi = new RingApi({
     refreshToken: REFRESH_TOKEN,
     cameraStatusPollingSeconds: 20,
-    debug: false, // Turned off debug so it doesn't flood your logs once working
+    debug: false,
   });
 
   ringApi.onRefreshTokenUpdated.subscribe(({ newRefreshToken }) => {
     log("Refresh token updated -- saving to .env");
     const envPath = resolve(__dirname, ".env");
     let content = readFileSync(envPath, "utf-8");
-    content = content.replace(
-      /RING_REFRESH_TOKEN=.*/,
-      `RING_REFRESH_TOKEN=${newRefreshToken}`
-    );
+    content = content.replace(/RING_REFRESH_TOKEN=.*/, `RING_REFRESH_TOKEN=${newRefreshToken}`);
     writeFileSync(envPath, content);
   });
 
@@ -158,10 +385,7 @@ async function main() {
   }
   log(`Location: "${location.name}" (id: ${location.id})`);
 
-  // Find camera
-  const targetCamera = location.cameras.find((c) =>
-    c.name.toLowerCase().includes(CAMERA_NAME)
-  );
+  const targetCamera = location.cameras.find((c) => nameMatches(c.name, CAMERA_NAME));
   if (!targetCamera) {
     logError(`No camera matching "${CAMERA_NAME}"`);
     log(`Available: ${location.cameras.map((c) => c.name).join(", ")}`);
@@ -174,11 +398,10 @@ async function main() {
     process.exit(1);
   }
 
-  log("\nAttempting to connect to alarm hub WebSocket...");
+  log("Connecting to alarm hub WebSocket...");
 
   const MAX_ATTEMPTS = 3;
   const TIMEOUT_MS = 30000;
-
   let devices = null;
 
   for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
@@ -189,7 +412,7 @@ async function main() {
           setTimeout(() => reject(new Error(`Timed out after ${TIMEOUT_MS / 1000}s`)), TIMEOUT_MS)
         ),
       ]);
-      log(`Connected! Got ${devices.length} devices.`);
+      log(`Connected. Got ${devices.length} devices.`);
       break;
     } catch (err) {
       logError(`Hub connection attempt ${attempt}/${MAX_ATTEMPTS} failed`, err);
@@ -205,57 +428,47 @@ async function main() {
     process.exit(1);
   }
 
-  const contactSensors = devices.filter(
-    (d) =>
-      d.data.deviceType === RingDeviceType.ContactSensor &&
-      d.name.toLowerCase().includes(SENSOR_NAME)
+  // Pick every contact sensor we care about: the snooze sensor + every sensor
+  // referenced by the blind mapping.
+  const allContact = devices.filter((d) => d.data.deviceType === RingDeviceType.ContactSensor);
+  const wanted = new Set([SENSOR_NAME, ...Object.values(blindMap).map((s) => s.toLowerCase())]);
+  const sensors = allContact.filter((d) =>
+    [...wanted].some((k) => nameMatches(d.name, k))
   );
 
-  if (contactSensors.length === 0) {
-    logError(`No contact sensor matching "${SENSOR_NAME}"`);
+  if (sensors.length === 0) {
+    logError(`No contact sensors matched any of: ${[...wanted].join(", ")}`);
+    log(`Available: ${allContact.map((d) => d.name).join(", ")}`);
     process.exit(1);
   }
 
-  let lastSnoozeTime = 0;
-
-  for (const sensor of contactSensors) {
-    log(`Watching: "${sensor.name}" (faulted=${sensor.data.faulted})`);
-
-    sensor.onData.subscribe((data) => {
-      if (data.faulted) {
-        const now = Date.now();
-        const elapsed = (now - lastSnoozeTime) / 1000;
-
-        if (elapsed < COOLDOWN_SECONDS) {
-          log(`Door opened -- cooldown active (${Math.round(elapsed)}s/${COOLDOWN_SECONDS}s)`);
-          return;
-        }
-
-        log(`\n>>> DOOR OPENED -- Triggering automation...`);
-        lastSnoozeTime = now;
-
-        snoozeCamera(ringApi, targetCamera, SNOOZE_MINUTES);
-      } else {
-        log("Door CLOSED");
-      }
-    });
+  // Warn about mapping entries that don't resolve to a real sensor.
+  for (const sensorKey of Object.values(blindMap)) {
+    if (!findSensorByKey(sensors, sensorKey)) {
+      log(`WARN: mapping references sensor "${sensorKey}" but no contact sensor matches.`);
+    }
   }
 
-  log("\nAutomation active! Listening for door events...");
+  subscribeSensors(sensors, ringApi, targetCamera);
+
+  if (blindsEnabled) {
+    try {
+      await connectDirigera();
+      scheduleSunset(sensors);
+    } catch (err) {
+      logError("Dirigera setup failed -- blind automation disabled this run", err);
+    }
+  }
+
+  log("Automation active.");
 }
 
 // ---------------------------------------------------------------------------
 // Lifecycle
 // ---------------------------------------------------------------------------
 
-process.on("SIGINT", () => {
-  log("Shutting down (SIGINT)...");
-  process.exit(0);
-});
-process.on("SIGTERM", () => {
-  log("Shutting down (SIGTERM)...");
-  process.exit(0);
-});
+process.on("SIGINT", () => { log("Shutting down (SIGINT)..."); process.exit(0); });
+process.on("SIGTERM", () => { log("Shutting down (SIGTERM)..."); process.exit(0); });
 process.on("unhandledRejection", (err) => logError("Unhandled rejection", err));
 
 main().catch((err) => {
