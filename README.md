@@ -1,6 +1,7 @@
-# Ring + Dirigera home glue
+# Ring local enhancements
 
-Two automations in one Node service:
+Local-network glue for a Ring + IKEA Dirigera home. Two automations in
+one Node service:
 
 1. **Camera snooze on door open** — when a designated Ring Alarm contact
    sensor opens, silence "Person Detected" notifications on a Ring camera
@@ -33,7 +34,7 @@ Two automations in one Node service:
 ## Setup
 
 ```bash
-cd ring-door-snooze
+cd ring-local-enhancements
 npm install
 
 # Ring: generate a refresh token (interactive 2FA prompt)
@@ -95,13 +96,13 @@ logged with a `WARN:` line at startup.
 ## Running as a Service (systemd)
 
 ```bash
-sudo cp ring-door-snooze.service /etc/systemd/system/
+sudo cp ring-local-enhancements.service /etc/systemd/system/
 # Edit if your username or install path differs
 sudo systemctl daemon-reload
-sudo systemctl enable ring-door-snooze
-sudo systemctl start ring-door-snooze
+sudo systemctl enable ring-local-enhancements
+sudo systemctl start ring-local-enhancements
 
-journalctl -u ring-door-snooze -f
+journalctl -u ring-local-enhancements -f
 ```
 
 ## Configuration

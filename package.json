@@ -1,7 +1,7 @@
 {
-  "name": "ring-door-snooze",
+  "name": "ring-local-enhancements",
   "version": "1.1.0",
-  "description": "Snooze Ring camera motion alerts when a door opens, and gate Dirigera blind sunset-close on door state",
+  "description": "Local-network enhancements for a Ring + Dirigera home: snooze camera alerts on door open, and gate Dirigera blind sunset-close on door state",
   "type": "module",
   "main": "index.mjs",
   "scripts": {

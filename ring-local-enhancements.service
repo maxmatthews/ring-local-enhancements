@@ -1,12 +1,12 @@
 [Unit]
-Description=Ring Door Sensor Camera Snooze Automation
+Description=Ring Local Enhancements (camera snooze + Dirigera sunset gate)
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
 User=pi
-WorkingDirectory=/home/pi/ring-door-snooze
+WorkingDirectory=/home/pi/ring-local-enhancements
 ExecStart=/home/pi/.nvm/versions/node/v24.14.1/bin/node index.mjs
 Restart=always
 RestartSec=30
@@ -14,13 +14,13 @@ RestartSec=30
 # Logging
 StandardOutput=journal
 StandardError=journal
-SyslogIdentifier=ring-door-snooze
+SyslogIdentifier=ring-local-enhancements
 
 # Hardening
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=read-only
-ReadWritePaths=/home/pi/ring-door-snooze
+ReadWritePaths=/home/pi/ring-local-enhancements
 
 [Install]
 WantedBy=multi-user.target
