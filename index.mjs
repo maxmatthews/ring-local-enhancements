@@ -354,7 +354,7 @@ function subscribeSensors(sensors, ringApi, targetCamera) {
 // ---------------------------------------------------------------------------
 
 async function main() {
-  log("Ring door snooze + Dirigera sunset gate");
+  log("Ring local enhancements (camera snooze + Dirigera sunset gate)");
   log(`  Snooze sensor: "${SENSOR_NAME}" -> camera: "${CAMERA_NAME}" (${SNOOZE_MINUTES}min, ${COOLDOWN_SECONDS}s cooldown)`);
   if (blindsEnabled) {
     log(`  Dirigera: ${DIRIGERA_HOST} | lat,lon: ${LATITUDE},${LONGITUDE} | post-close delay: ${POST_CLOSE_DELAY_SECONDS}s`);
