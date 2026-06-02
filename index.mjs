@@ -61,6 +61,32 @@ const LONGITUDE = parseFloat(process.env.LONGITUDE || "");
 const BLIND_SENSOR_MAP_FILE = process.env.BLIND_SENSOR_MAP_FILE || "blind-sensor-map.json";
 const POST_CLOSE_DELAY_SECONDS = parseInt(process.env.POST_CLOSE_DELAY_SECONDS || "60", 10);
 const BLIND_CLOSED_LEVEL = 100;
+const BLIND_CLOSE_SPACING_MS = 10 * 1000;
+const RETRY_DELAY_MS = 5 * 60 * 1000;
+const MAX_RETRY_PASSES = 2;
+
+// Sunset close order. Blinds whose names don't match any entry here close last,
+// in whatever order Dirigera returned them.
+const CLOSE_ORDER = [
+  "Office Left",
+  "Office Right",
+  "Living Room Left",
+  "Living Room Center",
+  "Dining Room Center",
+  "Living Room Right",
+  "Dining Room Left",
+  "Dining Room Right",
+  "Kitchen Left",
+  "Kitchen Center",
+  "Kitchen Right",
+  "Back Door",
+  "Family Room Left",
+  "Family Room Right",
+  "Bedroom Right",
+  "Bedroom Center",
+  "Bedroom Left",
+  "Primary Bathroom",
+];
 
 if (!REFRESH_TOKEN) {
   console.error("RING_REFRESH_TOKEN is required.");
@@ -223,6 +249,55 @@ async function closeBlind(blindId, blindName) {
   }
 }
 
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+function closeOrderIndex(blindName) {
+  const lower = blindName.toLowerCase();
+  const idx = CLOSE_ORDER.findIndex((entry) => lower.includes(entry.toLowerCase()));
+  return idx === -1 ? Number.MAX_SAFE_INTEGER : idx;
+}
+
+async function closeBlindsSequentially(targets) {
+  for (let i = 0; i < targets.length; i++) {
+    await closeBlind(targets[i].id, targets[i].name);
+    if (i < targets.length - 1) await sleep(BLIND_CLOSE_SPACING_MS);
+  }
+}
+
+async function retryStillOpen(targets, pass) {
+  if (pass > MAX_RETRY_PASSES) return;
+  log(`Sunset retry ${pass}/${MAX_RETRY_PASSES}: waiting ${RETRY_DELAY_MS / 60000}min before re-checking blind levels`);
+  await sleep(RETRY_DELAY_MS);
+
+  let current;
+  try {
+    current = await dirigera.blinds.list();
+  } catch (err) {
+    logError(`Retry ${pass}: failed to list blinds, skipping pass`, err);
+    return retryStillOpen(targets, pass + 1);
+  }
+  const byId = new Map(current.map((b) => [b.id, b]));
+
+  const stillOpen = [];
+  for (const t of targets) {
+    const b = byId.get(t.id);
+    const level = b?.attributes?.blindsCurrentLevel;
+    if (typeof level !== "number") {
+      log(`Retry ${pass}: "${t.name}" has no current-level reading, skipping`);
+      continue;
+    }
+    if (level < BLIND_CLOSED_LEVEL) stillOpen.push(t);
+  }
+
+  if (stillOpen.length === 0) {
+    log(`Retry ${pass}: all ${targets.length} blind(s) reporting closed.`);
+    return;
+  }
+  log(`Retry ${pass}: re-closing ${stillOpen.length} blind(s) still open: ${stillOpen.map((b) => b.name).join(", ")}`);
+  await closeBlindsSequentially(stillOpen);
+  await retryStillOpen(targets, pass + 1);
+}
+
 async function onSunset(sensors) {
   log(">>> SUNSET -- evaluating blinds");
 
@@ -240,20 +315,22 @@ async function onSunset(sensors) {
     return;
   }
 
+  const toClose = [];
+
   for (const blind of blinds) {
     const blindName = blind.attributes?.customName || blind.id;
     const sensorKey = findSensorKeyForBlind(blindName);
 
     if (!sensorKey) {
-      log(`"${blindName}": no sensor mapping, closing now`);
-      await closeBlind(blind.id, blindName);
+      log(`"${blindName}": no sensor mapping, queued for sunset close`);
+      toClose.push({ id: blind.id, name: blindName });
       continue;
     }
 
     const sensor = findSensorByKey(sensors, sensorKey);
     if (!sensor) {
-      log(`WARN: mapped sensor "${sensorKey}" not found for blind "${blindName}", closing anyway`);
-      await closeBlind(blind.id, blindName);
+      log(`WARN: mapped sensor "${sensorKey}" not found for blind "${blindName}", queued for sunset close`);
+      toClose.push({ id: blind.id, name: blindName });
       continue;
     }
 
@@ -266,10 +343,19 @@ async function onSunset(sensors) {
         timer: null,
       });
     } else {
-      log(`"${blindName}": sensor "${sensor.name}" is closed, closing blind now`);
-      await closeBlind(blind.id, blindName);
+      log(`"${blindName}": sensor "${sensor.name}" is closed, queued for sunset close`);
+      toClose.push({ id: blind.id, name: blindName });
     }
   }
+
+  toClose.sort((a, b) => closeOrderIndex(a.name) - closeOrderIndex(b.name));
+  if (toClose.length === 0) {
+    log("Sunset: no blinds to close (all deferred or none mapped).");
+    return;
+  }
+  log(`Sunset: closing ${toClose.length} blind(s), ${BLIND_CLOSE_SPACING_MS / 1000}s between each: ${toClose.map((b) => b.name).join(" -> ")}`);
+  await closeBlindsSequentially(toClose);
+  retryStillOpen(toClose, 1).catch((err) => logError("Sunset retry pass failed", err));
 }
 
 // ---------------------------------------------------------------------------
