@@ -1,0 +1,6 @@
+[Unit]
+Description=Vacuum systemd journal entries older than 14 days
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/journalctl --vacuum-time=14d
