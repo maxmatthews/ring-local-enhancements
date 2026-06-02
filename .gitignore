@@ -1,3 +1,4 @@
 .env
+.env.pi.bak
 node_modules/*
 blind-sensor-map.json
