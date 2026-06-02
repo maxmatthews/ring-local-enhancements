@@ -116,8 +116,9 @@ function loadBlindSensorMap() {
     const raw = JSON.parse(readFileSync(mapPath, "utf-8"));
     const cleaned = {};
     for (const [k, v] of Object.entries(raw)) {
-      if (k.startsWith("_") || typeof v !== "string") continue;
-      cleaned[k] = v;
+      if (k.startsWith("_")) continue;
+      if (typeof v === "string") cleaned[k] = [v];
+      else if (Array.isArray(v) && v.every((x) => typeof x === "string")) cleaned[k] = v;
     }
     return cleaned;
   } catch (err) {
@@ -132,9 +133,9 @@ function nameMatches(realName, partialKey) {
   return realName.toLowerCase().includes(partialKey.toLowerCase());
 }
 
-function findSensorKeyForBlind(blindName) {
-  for (const [blindKey, sensorKey] of Object.entries(blindMap)) {
-    if (nameMatches(blindName, blindKey)) return sensorKey;
+function findSensorKeysForBlind(blindName) {
+  for (const [blindKey, sensorKeys] of Object.entries(blindMap)) {
+    if (nameMatches(blindName, blindKey)) return sensorKeys;
   }
   return null;
 }
@@ -146,7 +147,7 @@ function findSensorKeyForBlind(blindName) {
 // sensorId -> { name, isOpen }
 const sensorState = new Map();
 
-// blindId -> { blindName, sensorId, sensorName, timer }
+// blindId -> { blindName, sensorIds: Set<string>, sensorNames: string[], timer }
 const pendingCloses = new Map();
 
 function isSensorOpen(sensorId) {
@@ -319,31 +320,34 @@ async function onSunset(sensors) {
 
   for (const blind of blinds) {
     const blindName = blind.attributes?.customName || blind.id;
-    const sensorKey = findSensorKeyForBlind(blindName);
+    const sensorKeys = findSensorKeysForBlind(blindName);
 
-    if (!sensorKey) {
+    if (!sensorKeys) {
       log(`"${blindName}": no sensor mapping, queued for sunset close`);
       toClose.push({ id: blind.id, name: blindName });
       continue;
     }
 
-    const sensor = findSensorByKey(sensors, sensorKey);
-    if (!sensor) {
-      log(`WARN: mapped sensor "${sensorKey}" not found for blind "${blindName}", queued for sunset close`);
+    const mappedSensors = sensorKeys
+      .map((k) => findSensorByKey(sensors, k))
+      .filter(Boolean);
+    if (mappedSensors.length === 0) {
+      log(`WARN: none of mapped sensors [${sensorKeys.join(", ")}] found for "${blindName}", queued for sunset close`);
       toClose.push({ id: blind.id, name: blindName });
       continue;
     }
 
-    if (isSensorOpen(sensor.id)) {
-      log(`Deferring "${blindName}" -- sensor "${sensor.name}" is open`);
+    const openSensors = mappedSensors.filter((s) => isSensorOpen(s.id));
+    if (openSensors.length > 0) {
+      log(`Deferring "${blindName}" -- open sensor(s): ${openSensors.map((s) => s.name).join(", ")}`);
       pendingCloses.set(blind.id, {
         blindName,
-        sensorId: sensor.id,
-        sensorName: sensor.name,
+        sensorIds: new Set(mappedSensors.map((s) => s.id)),
+        sensorNames: mappedSensors.map((s) => s.name),
         timer: null,
       });
     } else {
-      log(`"${blindName}": sensor "${sensor.name}" is closed, queued for sunset close`);
+      log(`"${blindName}": all sensor(s) closed (${mappedSensors.map((s) => s.name).join(", ")}), queued for sunset close`);
       toClose.push({ id: blind.id, name: blindName });
     }
   }
@@ -388,11 +392,17 @@ function scheduleSunset(sensors) {
 // Sensor subscription + transition dispatch
 // ---------------------------------------------------------------------------
 
+function inNightWindow() {
+  const now = new Date();
+  const today = SunCalc.getTimes(now, LATITUDE, LONGITUDE);
+  return now >= today.sunset || now < today.sunrise;
+}
+
 function onSensorTransition(sensor, nowOpen) {
   if (nowOpen) {
-    // If the door reopens during the post-close grace window, cancel the close.
+    // If any mapped sensor reopens during the grace window, cancel the close.
     for (const pending of pendingCloses.values()) {
-      if (pending.sensorId === sensor.id && pending.timer) {
+      if (pending.sensorIds.has(sensor.id) && pending.timer) {
         clearTimeout(pending.timer);
         pending.timer = null;
         log(`"${sensor.name}" reopened -- cancelling close timer for "${pending.blindName}"`);
@@ -401,11 +411,22 @@ function onSensorTransition(sensor, nowOpen) {
     return;
   }
 
-  // Sensor just closed. Start the grace timer for any blinds waiting on it.
+  // A mapped sensor just closed. Start the grace timer only if ALL mapped sensors are closed.
   for (const [blindId, pending] of pendingCloses) {
-    if (pending.sensorId !== sensor.id || pending.timer) continue;
-    log(`"${sensor.name}" closed -- closing "${pending.blindName}" in ${POST_CLOSE_DELAY_SECONDS}s`);
+    if (!pending.sensorIds.has(sensor.id) || pending.timer) continue;
+    const stillOpen = [...pending.sensorIds].filter((id) => isSensorOpen(id));
+    if (stillOpen.length > 0) {
+      const names = stillOpen.map((id) => sensorState.get(id)?.name || id);
+      log(`"${sensor.name}" closed -- "${pending.blindName}" still waiting on: ${names.join(", ")}`);
+      continue;
+    }
+    log(`All sensors closed for "${pending.blindName}" -- closing in ${POST_CLOSE_DELAY_SECONDS}s`);
     pending.timer = setTimeout(async () => {
+      if (!inNightWindow()) {
+        log(`Skipping deferred close for "${pending.blindName}" -- now past sunrise`);
+        pendingCloses.delete(blindId);
+        return;
+      }
       await closeBlind(blindId, pending.blindName);
       pendingCloses.delete(blindId);
     }, POST_CLOSE_DELAY_SECONDS * 1000);
@@ -517,7 +538,8 @@ async function main() {
   // Pick every contact sensor we care about: the snooze sensor + every sensor
   // referenced by the blind mapping.
   const allContact = devices.filter((d) => d.data.deviceType === RingDeviceType.ContactSensor);
-  const wanted = new Set([SENSOR_NAME, ...Object.values(blindMap).map((s) => s.toLowerCase())]);
+  const mappedSensorKeys = Object.values(blindMap).flat();
+  const wanted = new Set([SENSOR_NAME, ...mappedSensorKeys.map((s) => s.toLowerCase())]);
   const sensors = allContact.filter((d) =>
     [...wanted].some((k) => nameMatches(d.name, k))
   );
@@ -529,7 +551,7 @@ async function main() {
   }
 
   // Warn about mapping entries that don't resolve to a real sensor.
-  for (const sensorKey of Object.values(blindMap)) {
+  for (const sensorKey of mappedSensorKeys) {
     if (!findSensorByKey(sensors, sensorKey)) {
       log(`WARN: mapping references sensor "${sensorKey}" but no contact sensor matches.`);
     }
