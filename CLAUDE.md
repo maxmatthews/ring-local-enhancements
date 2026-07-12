@@ -4,7 +4,11 @@
 
 - Runs on a Raspberry Pi reachable at `pi.local` (user `pi`).
 - Project lives at `/home/pi/ring-local-enhancements` on the Pi.
-- Managed by the `ring-local-enhancements.service` systemd unit.
+- Managed by pm2 (`ecosystem.config.cjs`), running under the pi user's pm2
+  daemon (`pm2-pi.service`), consistent with the other projects on this Pi.
+- `journal-cleaner` stays on its systemd timer — it's a system-level
+  `journalctl --vacuum-time` maintenance job, not an app process, so it
+  doesn't fit the pm2 model.
 
 ## Secrets
 
