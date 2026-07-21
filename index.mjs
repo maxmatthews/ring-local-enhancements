@@ -527,6 +527,22 @@ function isAlarmActive(data) {
   return statuses.some((s) => s === "active");
 }
 
+// The canonical "there is an active fire/CO alarm" signal in Ring Alarm lives on
+// the security panel's alarmInfo.state -- individual smoke/CO detectors don't
+// reliably flip their own alarmStatus in the data shadow (confirmed on real
+// hardware). Watching the panel catches ANY smoke/CO detector at once.
+const FIRE_CO_ALARM_STATES = new Set([
+  "fire-alarm",
+  "co-alarm",
+  "user-verified-co-or-fire-alarm",
+  "fire-accelerated-alarm",
+]);
+
+function panelFireCoState(data) {
+  const state = data?.alarmInfo?.state;
+  return state && FIRE_CO_ALARM_STATES.has(state) ? state : null;
+}
+
 let lastUnlockTime = 0;
 
 async function triggerSmokeUnlock(stClient, sourceName) {
@@ -566,6 +582,37 @@ function setupSmokeUnlock(devices, stClient) {
       }
     });
   }
+}
+
+// Watch the Ring Alarm security panel's alarmInfo for a fire/CO alarm -- the
+// primary, device-agnostic detection path.
+function setupPanelAlarmWatch(devices, stClient) {
+  const panel =
+    devices.find((d) => d.data.deviceType === RingDeviceType.SecurityPanel) ||
+    devices.find((d) => String(d.data.deviceType).includes("security-panel"));
+  if (!panel) {
+    log("WARN: no security panel found -- panel-based fire/CO detection disabled.");
+    return;
+  }
+  log(`Watching security panel "${panel.name}" for fire/CO alarm (alarmInfo.state=${panel.data?.alarmInfo?.state || "none"})`);
+  const initial = panelFireCoState(panel.data);
+  if (initial) triggerSmokeUnlock(stClient, `panel:${initial}`);
+
+  let lastPanelState = panel.data?.alarmInfo?.state;
+  panel.onData.subscribe((data) => {
+    // Log any alarm-state transition -- quiet normally, an audit trail during
+    // any alarm, and confirms the panel is delivering alarmInfo.
+    const s = data?.alarmInfo?.state;
+    if (s !== lastPanelState) {
+      log(`Security panel alarmInfo.state: ${lastPanelState || "none"} -> ${s || "none"}`);
+      lastPanelState = s;
+    }
+    const state = panelFireCoState(data);
+    if (state) {
+      log(`>>> Security panel reports FIRE/CO ALARM: ${state}`);
+      triggerSmokeUnlock(stClient, `panel:${state}`);
+    }
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -688,6 +735,7 @@ async function main() {
         },
       });
       setupSmokeUnlock(devices, stClient);
+      setupPanelAlarmWatch(devices, stClient);
 
       // Keep the token warm. Two reasons this matters for a life-safety path:
       //  1. An unlock never has to wait on (or fail from) a cold refresh mid-alarm.
