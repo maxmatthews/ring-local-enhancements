@@ -486,10 +486,20 @@ function subscribeSensors(sensors, ringApi, targetCamera) {
 // arrives over Ring's cloud), so a local unlock would gain nothing here. Treat
 // it as a supplement to, not a replacement for, normal egress.
 
-// Undefined enum members are dropped so an unknown type can't match by accident.
+// Known smoke/CO device types (undefined enum members dropped). We also match
+// by pattern below so a dedicated alarm isn't missed if the enum name drifts.
 const SMOKE_CO_TYPES = new Set(
   [RingDeviceType.SmokeAlarm, RingDeviceType.CoAlarm, RingDeviceType.SmokeCoListener].filter(Boolean)
 );
+
+// True for smoke/CO alarms and listeners. The pattern catches types like
+// "alarm.smoke", "sensor.co", "listener.smoke-co" without matching unrelated
+// devices (e.g. "sensor.contact" -- "co" there isn't token-bounded).
+function isSmokeCoDevice(device) {
+  const type = String(device?.data?.deviceType || "");
+  if (SMOKE_CO_TYPES.has(type)) return true;
+  return /smoke|(^|[.\-])co([.\-]|$)/i.test(type);
+}
 
 // Ring exposes alarm state differently across smoke/CO device types: a
 // top-level alarmStatus on dedicated alarms, and nested smoke/co blocks on the
@@ -520,7 +530,7 @@ async function triggerSmokeUnlock(stClient, sourceName) {
 }
 
 function setupSmokeUnlock(devices, stClient) {
-  const smokeDevices = devices.filter((d) => SMOKE_CO_TYPES.has(d.data.deviceType));
+  const smokeDevices = devices.filter(isSmokeCoDevice);
   if (smokeDevices.length === 0) {
     log("WARN: smoke-unlock enabled but no smoke/CO devices found on the hub.");
     return;

@@ -29,7 +29,7 @@ import { exec } from "child_process";
 import {
   buildAuthorizeUrl,
   exchangeAuthCode,
-  createSmartThingsClient,
+  API_BASE,
 } from "./smartthings-lock.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -131,15 +131,18 @@ async function main() {
   }
   console.log("Got tokens. Listing devices...\n");
 
-  const client = createSmartThingsClient({
-    clientId: CLIENT_ID,
-    clientSecret: CLIENT_SECRET,
-    refreshToken: token.refresh_token,
-  });
-
+  // List devices with the access token from the code exchange directly.
+  // Do NOT refresh here: SmartThings rotates the refresh token on every
+  // refresh, which would invalidate the token.refresh_token we're about to
+  // print and save. The code exchange already gave us a valid access token.
   const locks = [];
   try {
-    const devices = await client.listDevices();
+    const res = await fetch(`${API_BASE}/devices`, {
+      headers: { Authorization: `Bearer ${token.access_token}`, Accept: "application/json" },
+    });
+    const json = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(`${res.status}: ${JSON.stringify(json)}`);
+    const devices = json.items || [];
     if (devices.length === 0) {
       console.log("No devices returned (check the app's scopes / that you authorized a location).");
     } else {
