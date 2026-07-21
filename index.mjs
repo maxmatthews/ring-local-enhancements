@@ -15,6 +15,7 @@
 
 import { RingApi, RingDeviceType } from "ring-client-api";
 import { createDirigeraClient } from "dirigera";
+import { createSmartThingsClient } from "./smartthings-lock.mjs";
 import SunCalc from "suncalc";
 import { readFileSync, writeFileSync, existsSync } from "fs";
 import { resolve, dirname } from "path";
@@ -60,6 +61,13 @@ const LATITUDE = parseFloat(process.env.LATITUDE || "");
 const LONGITUDE = parseFloat(process.env.LONGITUDE || "");
 const BLIND_SENSOR_MAP_FILE = process.env.BLIND_SENSOR_MAP_FILE || "blind-sensor-map.json";
 const POST_CLOSE_DELAY_SECONDS = parseInt(process.env.POST_CLOSE_DELAY_SECONDS || "60", 10);
+
+// SmartThings smoke-triggered auto-unlock (Ultraloq lock linked into SmartThings).
+const ST_CLIENT_ID = process.env.ST_CLIENT_ID;
+const ST_CLIENT_SECRET = process.env.ST_CLIENT_SECRET;
+const ST_REFRESH_TOKEN = process.env.ST_REFRESH_TOKEN;
+const ST_LOCK_DEVICE_ID = process.env.ST_LOCK_DEVICE_ID;
+const SMOKE_UNLOCK_COOLDOWN_SECONDS = parseInt(process.env.SMOKE_UNLOCK_COOLDOWN_SECONDS || "300", 10);
 const BLIND_CLOSED_LEVEL = 100;
 const BLIND_CLOSE_SPACING_MS = 10 * 1000;
 const RETRY_DELAY_MS = 5 * 60 * 1000;
@@ -94,12 +102,23 @@ if (!REFRESH_TOKEN) {
 }
 
 const blindsEnabled = !!(DIRIGERA_HOST && DIRIGERA_TOKEN && Number.isFinite(LATITUDE) && Number.isFinite(LONGITUDE));
+const smokeUnlockEnabled = !!(ST_CLIENT_ID && ST_CLIENT_SECRET && ST_REFRESH_TOKEN && ST_LOCK_DEVICE_ID);
 
 function log(msg) {
   console.log(`[${new Date().toISOString()}] ${msg}`);
 }
 function logError(msg, err) {
   console.error(`[${new Date().toISOString()}] ERROR: ${msg}`, err?.message || err);
+}
+
+// Upsert a single KEY=value line in .env (replace if present, else append).
+function persistEnvVar(key, value) {
+  const envPath = resolve(__dirname, ".env");
+  let content = readFileSync(envPath, "utf-8");
+  const re = new RegExp(`^${key}=.*$`, "m");
+  if (re.test(content)) content = content.replace(re, `${key}=${value}`);
+  else content = content.replace(/\n?$/, `\n${key}=${value}\n`);
+  writeFileSync(envPath, content);
 }
 
 // ---------------------------------------------------------------------------
@@ -457,6 +476,70 @@ function subscribeSensors(sensors, ringApi, targetCamera) {
 }
 
 // ---------------------------------------------------------------------------
+// Smoke/CO -> SmartThings lock auto-unlock
+// ---------------------------------------------------------------------------
+//
+// Life-safety automation: when a Ring smoke/CO device reports an ACTIVE alarm,
+// send the unlock command to the Ultraloq lock via SmartThings. Unlock only --
+// we never re-lock during an alarm; you relock manually once it's clear.
+// Cloud-dependent, but so is the Ring smoke trigger itself (the hub event
+// arrives over Ring's cloud), so a local unlock would gain nothing here. Treat
+// it as a supplement to, not a replacement for, normal egress.
+
+// Undefined enum members are dropped so an unknown type can't match by accident.
+const SMOKE_CO_TYPES = new Set(
+  [RingDeviceType.SmokeAlarm, RingDeviceType.CoAlarm, RingDeviceType.SmokeCoListener].filter(Boolean)
+);
+
+// Ring exposes alarm state differently across smoke/CO device types: a
+// top-level alarmStatus on dedicated alarms, and nested smoke/co blocks on the
+// combined listener. Any "active" among them counts as an alarm.
+function isAlarmActive(data) {
+  return [data?.alarmStatus, data?.smoke?.alarmStatus, data?.co?.alarmStatus].some(
+    (s) => s === "active"
+  );
+}
+
+let lastUnlockTime = 0;
+
+async function triggerSmokeUnlock(stClient, sourceName) {
+  const now = Date.now();
+  const elapsed = (now - lastUnlockTime) / 1000;
+  if (elapsed < SMOKE_UNLOCK_COOLDOWN_SECONDS) {
+    log(`SMOKE/CO ALARM (${sourceName}) -- unlock cooldown active (${Math.round(elapsed)}s/${SMOKE_UNLOCK_COOLDOWN_SECONDS}s), skipping`);
+    return;
+  }
+  lastUnlockTime = now;
+  log(`>>> SMOKE/CO ALARM ACTIVE (${sourceName}) -- UNLOCKING SmartThings lock ${ST_LOCK_DEVICE_ID}`);
+  try {
+    await stClient.unlockLock(ST_LOCK_DEVICE_ID);
+    log(">>> Unlock command sent to SmartThings.");
+  } catch (err) {
+    logError("Failed to send unlock command to SmartThings", err);
+  }
+}
+
+function setupSmokeUnlock(devices, stClient) {
+  const smokeDevices = devices.filter((d) => SMOKE_CO_TYPES.has(d.data.deviceType));
+  if (smokeDevices.length === 0) {
+    log("WARN: smoke-unlock enabled but no smoke/CO devices found on the hub.");
+    return;
+  }
+  for (const dev of smokeDevices) {
+    const active = isAlarmActive(dev.data);
+    log(`Watching smoke/CO device: "${dev.name}" (${dev.data.deviceType}, alarmActive=${active})`);
+    if (active) triggerSmokeUnlock(stClient, dev.name);
+
+    dev.onData.subscribe((data) => {
+      if (isAlarmActive(data)) {
+        log(`Smoke/CO device "${dev.name}" reports ALARM ACTIVE`);
+        triggerSmokeUnlock(stClient, dev.name);
+      }
+    });
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
 
@@ -468,6 +551,11 @@ async function main() {
     log(`  Blind mapping: ${Object.keys(blindMap).length ? JSON.stringify(blindMap) : "(none)"}`);
   } else {
     log("  Dirigera disabled (missing DIRIGERA_HOST / DIRIGERA_TOKEN / LATITUDE / LONGITUDE)");
+  }
+  if (smokeUnlockEnabled) {
+    log(`  Smoke-unlock: armed -> SmartThings lock ${ST_LOCK_DEVICE_ID} (cooldown ${SMOKE_UNLOCK_COOLDOWN_SECONDS}s)`);
+  } else {
+    log("  Smoke-unlock disabled (missing ST_CLIENT_ID / ST_CLIENT_SECRET / ST_REFRESH_TOKEN / ST_LOCK_DEVICE_ID)");
   }
 
   const ringApi = new RingApi({
@@ -558,6 +646,38 @@ async function main() {
   }
 
   subscribeSensors(sensors, ringApi, targetCamera);
+
+  if (smokeUnlockEnabled) {
+    try {
+      const stClient = createSmartThingsClient({
+        clientId: ST_CLIENT_ID,
+        clientSecret: ST_CLIENT_SECRET,
+        refreshToken: ST_REFRESH_TOKEN,
+        onRefreshToken: (t) => {
+          log("SmartThings refresh token rotated -- saving to .env");
+          persistEnvVar("ST_REFRESH_TOKEN", t);
+        },
+      });
+      setupSmokeUnlock(devices, stClient);
+
+      // Keep the token warm. Two reasons this matters for a life-safety path:
+      //  1. An unlock never has to wait on (or fail from) a cold refresh mid-alarm.
+      //  2. SmartThings refresh tokens expire in ~30 days and rotate on use, so
+      //     without periodic refreshes a month of quiet would silently expire the
+      //     token. Refreshing well inside that window keeps it alive and rotating.
+      const keepTokenFresh = async () => {
+        try {
+          await stClient.ensureAccessToken();
+        } catch (err) {
+          logError("SmartThings token keepalive failed -- unlock may not work until fixed", err);
+        }
+      };
+      await keepTokenFresh(); // validate creds now, surfacing problems at startup
+      setInterval(keepTokenFresh, 12 * 60 * 60 * 1000).unref();
+    } catch (err) {
+      logError("SmartThings setup failed -- smoke-unlock disabled this run", err);
+    }
+  }
 
   if (blindsEnabled) {
     try {

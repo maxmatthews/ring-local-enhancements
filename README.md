@@ -11,6 +11,9 @@ one Node service:
    every IKEA Dirigera blind. Skip any blind whose mapped contact sensor
    is currently open; close it `POST_CLOSE_DELAY_SECONDS` after the sensor
    reports closed. Blinds with no mapping always close.
+3. **Smoke-triggered lock unlock** — when a Ring smoke/CO device reports
+   an active alarm, unlock an Ultraloq lock via the SmartThings REST API.
+   Unlock only — it never re-locks during an alarm.
 
 ## How It Works
 
@@ -122,10 +125,57 @@ journalctl -u ring-local-enhancements -f
 | `LONGITUDE` | (optional) | Decimal degrees, for sunset calc |
 | `BLIND_SENSOR_MAP_FILE` | `blind-sensor-map.json` | Mapping file path |
 | `POST_CLOSE_DELAY_SECONDS` | `60` | Delay between sensor-close and blind-close |
+| `ST_CLIENT_ID` | (optional) | SmartThings OAuth2 client ID. Omit to disable smoke-unlock. |
+| `ST_CLIENT_SECRET` | (optional) | SmartThings OAuth2 client secret |
+| `ST_REFRESH_TOKEN` | (optional) | Refresh token from `npm run pair-smartthings` (auto-rotated) |
+| `ST_LOCK_DEVICE_ID` | (optional) | SmartThings device ID of the lock to unlock |
+| `SMOKE_UNLOCK_COOLDOWN_SECONDS` | `300` | Min gap between unlock commands |
 
 If any of `DIRIGERA_HOST`, `DIRIGERA_TOKEN`, `LATITUDE`, `LONGITUDE` are
 missing, the blind feature stays off and the service still does the
-camera snooze.
+camera snooze. Likewise, if any of the four required `ST_*` values are
+missing, the smoke-unlock stays off and the rest keeps running.
+
+### Smoke-triggered unlock (SmartThings)
+
+The Ultraloq lock is linked into **SmartThings** (cloud-to-cloud), and this
+drives it through the official SmartThings REST API. First create an
+**OAuth-In app** with the [SmartThings CLI](https://github.com/SmartThingsCommunity/smartthings-cli):
+
+```bash
+smartthings apps:create
+#  -> choose "OAuth-In App"
+#  -> Display Name / Description: anything (e.g. "ring-local-enhancements")
+#  -> Scopes: r:devices:*  and  x:devices:*
+#  -> Redirect URI: https://httpbin.org/get   (see note below)
+```
+
+**Redirect URI must be public HTTPS.** SmartThings returns a 403 on the
+authorize page for `http://localhost` URIs, so the pairing uses a public
+HTTPS redirect that just displays the code. `https://httpbin.org/get` works
+(it echoes the `?code=` back); anything public+HTTPS that lets you read the
+address bar is fine. It must match `ST_REDIRECT_URI` exactly.
+
+`apps:create` prints an **OAuth Client Id** and **OAuth Client Secret** (the
+secret is shown only once). Then, **on a machine with a browser**, mint a
+refresh token and find the lock's device ID:
+
+```bash
+ST_CLIENT_ID=xxx ST_CLIENT_SECRET=yyy npm run pair-smartthings
+```
+
+It opens the consent screen; after you approve, the browser lands on the
+redirect URL with `?code=...`. Paste that code (or the whole URL) at the
+prompt. It exchanges it, prints an `ST_REFRESH_TOKEN`, and lists your devices
+(locks flagged `* LOCK`). Copy `ST_CLIENT_ID`, `ST_CLIENT_SECRET`,
+`ST_REFRESH_TOKEN`, and the lock's `ST_LOCK_DEVICE_ID` into the Pi's `.env`.
+
+**This is a life-safety supplement, not a replacement.** Anyone inside can
+always egress via the thumb-turn; the auto-unlock mainly helps responders
+get in. It's a cloud path — but so is the Ring smoke *trigger* (the hub
+event arrives over Ring's cloud), so both halves already depend on the
+internet; a local unlock would not change that. The only fully-local
+alternative for *both* halves would be different detection + a Z-Wave lock.
 
 ### blind-sensor-map.json
 
@@ -146,6 +196,13 @@ Ring refresh tokens rotate. The service writes the updated token back to
 `.env` automatically (`onRefreshTokenUpdated`). The Dirigera access token
 does not rotate.
 
+SmartThings refresh tokens also rotate — on **every** refresh — and expire
+after ~30 days if unused. The service persists each rotated `ST_REFRESH_TOKEN`
+back to `.env`, and refreshes on a 12-hour keepalive so the token stays alive
+(and an unlock never waits on a cold refresh) even if no alarm fires for weeks.
+If the service is stopped for more than ~30 days, re-run `npm run
+pair-smartthings` to mint a fresh token.
+
 ## Caveats
 
 - **Unofficial Ring API**: `ring-client-api` is community-maintained. Ring
@@ -159,6 +216,13 @@ does not rotate.
 - **Blind direction**: this assumes `blindsTargetLevel: 100` = closed
   (rolled down), which matches FYRTUR/KADRILJ defaults. If yours go the
   other way, flip `BLIND_CLOSED_LEVEL` in `index.mjs`.
+- **SmartThings unlock is cloud + best-effort**: it goes through the
+  SmartThings (and U-tec) cloud, so it depends on internet + service uptime
+  and can't be guaranteed during a fire. The same is true of the Ring smoke
+  trigger, so this doesn't add a dependency the detection side didn't
+  already have. The smoke/CO alarm-state field names haven't been verified
+  against live hardware — the first time an alarm fires (or during a test),
+  check the logs to confirm the unlock actually triggered.
 
 ## Troubleshooting
 
