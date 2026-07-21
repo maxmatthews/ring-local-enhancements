@@ -11,9 +11,9 @@ one Node service:
    every IKEA Dirigera blind. Skip any blind whose mapped contact sensor
    is currently open; close it `POST_CLOSE_DELAY_SECONDS` after the sensor
    reports closed. Blinds with no mapping always close.
-3. **Smoke-triggered lock unlock** — when a Ring smoke/CO device reports
-   an active alarm, unlock an Ultraloq lock via the SmartThings REST API.
-   Unlock only — it never re-locks during an alarm.
+3. **Smoke-triggered lock unlock** — when the Ring Alarm panel reports a
+   fire or CO alarm (`alarmInfo.state`), unlock an Ultraloq lock via the
+   SmartThings REST API. Unlock only — it never re-locks during an alarm.
 
 ## How It Works
 
@@ -220,9 +220,17 @@ pair-smartthings` to mint a fresh token.
   SmartThings (and U-tec) cloud, so it depends on internet + service uptime
   and can't be guaranteed during a fire. The same is true of the Ring smoke
   trigger, so this doesn't add a dependency the detection side didn't
-  already have. The smoke/CO alarm-state field names haven't been verified
-  against live hardware — the first time an alarm fires (or during a test),
-  check the logs to confirm the unlock actually triggered.
+  already have.
+- **Detection is panel-based**: the primary trigger is the Ring Alarm
+  panel's `alarmInfo.state` (`fire-alarm` / `co-alarm` / the user-verified
+  and accelerated fire-CO variants). Individual smoke/CO detectors were
+  observed *not* to flip their own `alarmStatus` in the data shadow (the
+  Bluejay signals via `pushToTest`/impulses; the listener via impulses), so
+  per-device `alarmStatus` is only a backup. The unlock command → lock was
+  verified end-to-end; the panel `fire-alarm` trigger itself is per Ring's
+  data model but hadn't been observed firing (testing was done in Practice
+  Mode). The service logs every panel `alarmInfo.state` transition, so a
+  real event leaves an audit trail — check it after any alarm.
 
 ## Troubleshooting
 
