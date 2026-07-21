@@ -498,7 +498,13 @@ const SMOKE_CO_TYPES = new Set(
 function isSmokeCoDevice(device) {
   const type = String(device?.data?.deviceType || "");
   if (SMOKE_CO_TYPES.has(type)) return true;
-  return /smoke|(^|[.\-])co([.\-]|$)/i.test(type);
+  if (/smoke|(^|[.\-])co([.\-]|$)/i.test(type)) return true;
+  // Safety net: match by name too, for a detector whose type we don't
+  // recognize. Watching a mislabeled device is harmless -- an unlock still
+  // requires an actually-active alarm status (isAlarmActive), which a
+  // non-alarm device never reports.
+  const name = String(device?.name || "");
+  return /smoke|carbon monoxide/i.test(name);
 }
 
 // Ring exposes alarm state differently across smoke/CO device types: a
@@ -537,7 +543,9 @@ function setupSmokeUnlock(devices, stClient) {
   }
   for (const dev of smokeDevices) {
     const active = isAlarmActive(dev.data);
-    log(`Watching smoke/CO device: "${dev.name}" (${dev.data.deviceType}, alarmActive=${active})`);
+    // Log the raw data shape so we can confirm isAlarmActive reads the right
+    // fields for each device model (types differ between listener and detector).
+    log(`Watching smoke/CO device: "${dev.name}" (${dev.data.deviceType}) alarmActive=${active} data=${JSON.stringify(dev.data).slice(0, 800)}`);
     if (active) triggerSmokeUnlock(stClient, dev.name);
 
     dev.onData.subscribe((data) => {
