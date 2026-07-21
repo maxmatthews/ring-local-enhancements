@@ -543,22 +543,44 @@ function panelFireCoState(data) {
   return state && FIRE_CO_ALARM_STATES.has(state) ? state : null;
 }
 
-let lastUnlockTime = 0;
+const UNLOCK_MAX_ATTEMPTS = 5;
+const UNLOCK_RETRY_DELAY_MS = 3000;
+
+// Cooldown timer starts only after a SUCCESSFUL unlock. `unlockInProgress`
+// guards against overlapping attempts so concurrent triggers (panel + a
+// device firing at once) can never send two commands mid-retry.
+let lastUnlockSuccessTime = 0;
+let unlockInProgress = false;
 
 async function triggerSmokeUnlock(stClient, sourceName) {
-  const now = Date.now();
-  const elapsed = (now - lastUnlockTime) / 1000;
-  if (elapsed < SMOKE_UNLOCK_COOLDOWN_SECONDS) {
-    log(`SMOKE/CO ALARM (${sourceName}) -- unlock cooldown active (${Math.round(elapsed)}s/${SMOKE_UNLOCK_COOLDOWN_SECONDS}s), skipping`);
+  const elapsed = (Date.now() - lastUnlockSuccessTime) / 1000;
+  if (lastUnlockSuccessTime && elapsed < SMOKE_UNLOCK_COOLDOWN_SECONDS) {
+    log(`SMOKE/CO ALARM (${sourceName}) -- already unlocked ${Math.round(elapsed)}s ago (cooldown ${SMOKE_UNLOCK_COOLDOWN_SECONDS}s), skipping`);
     return;
   }
-  lastUnlockTime = now;
+  if (unlockInProgress) {
+    log(`SMOKE/CO ALARM (${sourceName}) -- unlock already in progress, skipping duplicate trigger`);
+    return;
+  }
+  unlockInProgress = true;
   log(`>>> SMOKE/CO ALARM ACTIVE (${sourceName}) -- UNLOCKING SmartThings lock ${ST_LOCK_DEVICE_ID}`);
   try {
-    await stClient.unlockLock(ST_LOCK_DEVICE_ID);
-    log(">>> Unlock command sent to SmartThings.");
-  } catch (err) {
-    logError("Failed to send unlock command to SmartThings", err);
+    for (let attempt = 1; attempt <= UNLOCK_MAX_ATTEMPTS; attempt++) {
+      try {
+        await stClient.unlockLock(ST_LOCK_DEVICE_ID);
+        lastUnlockSuccessTime = Date.now(); // cooldown starts only on success
+        log(`>>> Unlock command sent to SmartThings (attempt ${attempt}).`);
+        return;
+      } catch (err) {
+        logError(`Unlock attempt ${attempt}/${UNLOCK_MAX_ATTEMPTS} failed`, err);
+        if (attempt < UNLOCK_MAX_ATTEMPTS) await sleep(UNLOCK_RETRY_DELAY_MS);
+      }
+    }
+    // No cooldown set on total failure -- the next alarm update re-triggers,
+    // so an active alarm keeps retrying in bursts until it gets through.
+    logError(`Unlock failed after ${UNLOCK_MAX_ATTEMPTS} attempts -- will retry on the next alarm update`);
+  } finally {
+    unlockInProgress = false;
   }
 }
 
