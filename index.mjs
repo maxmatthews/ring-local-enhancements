@@ -511,9 +511,20 @@ function isSmokeCoDevice(device) {
 // top-level alarmStatus on dedicated alarms, and nested smoke/co blocks on the
 // combined listener. Any "active" among them counts as an alarm.
 function isAlarmActive(data) {
-  return [data?.alarmStatus, data?.smoke?.alarmStatus, data?.co?.alarmStatus].some(
-    (s) => s === "active"
-  );
+  if (!data || typeof data !== "object") return false;
+  const statuses = [data.alarmStatus, data.smoke?.alarmStatus, data.co?.alarmStatus];
+  // Ring "Bluejay" smoke/CO detectors (comp.bluejay.sensor_bluejay_sc) don't use
+  // the listener's top-level smoke/co fields; they nest alarm state under
+  // components["alarm.smoke"] / ["alarm.co"] (plus a low-level-CO status).
+  // Confirmed by watching a live device's data. We deliberately ignore
+  // components["alarm.end-of-life"] -- that's a device-replacement warning,
+  // not a fire -- and pushToTest, which is the self-test button, not an alarm.
+  const comp = data.components || {};
+  for (const key of ["alarm.smoke", "alarm.co"]) {
+    const c = comp[key];
+    if (c) statuses.push(c.alarmStatus, c.lowLevelAlarmStatus);
+  }
+  return statuses.some((s) => s === "active");
 }
 
 let lastUnlockTime = 0;
@@ -545,7 +556,7 @@ function setupSmokeUnlock(devices, stClient) {
     const active = isAlarmActive(dev.data);
     // Log the raw data shape so we can confirm isAlarmActive reads the right
     // fields for each device model (types differ between listener and detector).
-    log(`Watching smoke/CO device: "${dev.name}" (${dev.data.deviceType}) alarmActive=${active} data=${JSON.stringify(dev.data).slice(0, 800)}`);
+    log(`Watching smoke/CO device: "${dev.name}" (${dev.data.deviceType}, alarmActive=${active})`);
     if (active) triggerSmokeUnlock(stClient, dev.name);
 
     dev.onData.subscribe((data) => {
