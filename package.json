@@ -8,6 +8,7 @@
     "start": "node index.mjs",
     "test": "node test-level-sync.mjs",
     "diag": "node diag-level-sync.mjs",
+    "deploy": "./deploy.sh",
     "auth": "npx -p ring-client-api ring-auth-cli",
     "pair-dirigera": "npx dirigera authenticate",
     "pair-smartthings": "node pair-smartthings.mjs"

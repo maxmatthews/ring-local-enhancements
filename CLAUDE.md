@@ -10,8 +10,16 @@
 
 ## Deployment
 
+- **Deploy with `./deploy.sh`** (or `npm run deploy`). `--dry-run` shows what
+  would change; `--prune` also deletes Pi files no longer in the repo.
 - Runs on a Raspberry Pi reachable at `pi.local` (user `pi`).
 - Project lives at `/home/pi/ring-local-enhancements` on the Pi.
+- **The Pi's copy is NOT a git clone.** It has no remote and no commits — the
+  code is rsynced there. `git pull` on the Pi does not work and never has.
+  `deploy.sh` writes the deployed SHA to `.deployed-commit` on the Pi, which
+  is the only record of what's running.
+- `.env` and `blind-sensor-map.json` exist **only on the Pi** and are never
+  transferred or deleted by the deploy. Don't overwrite them with local copies.
 - Managed by pm2 (`ecosystem.config.cjs`), running under the pi user's pm2
   daemon (`pm2-pi.service`), consistent with the other projects on this Pi.
 - `journal-cleaner` stays on its systemd timer — it's a system-level

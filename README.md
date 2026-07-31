@@ -153,17 +153,42 @@ Name matching is case-insensitive partial — `front` matches `Front Door`.
 Any mapping entry that doesn't resolve to a real sensor or blind is
 logged with a `WARN:` line at startup.
 
-## Running as a Service (systemd)
+## Deploying
+
+The service runs on a Raspberry Pi under pm2 (`ecosystem.config.cjs`). Deploy
+from your dev machine:
 
 ```bash
-sudo cp ring-local-enhancements.service /etc/systemd/system/
-# Edit if your username or install path differs
-sudo systemctl daemon-reload
-sudo systemctl enable ring-local-enhancements
-sudo systemctl start ring-local-enhancements
-
-journalctl -u ring-local-enhancements -f
+npm run deploy
 ```
+
+`./deploy.sh --dry-run` shows what would change without touching the Pi;
+`--prune` also removes Pi files that are no longer in the repo. Override the
+target with `PI_HOST=pi@192.168.1.104 ./deploy.sh`.
+
+The script refuses to run on a dirty working tree, runs the tests locally and
+again on the Pi, restarts pm2, and fails loudly if the app doesn't come back
+online. It prints a rollback command on success.
+
+**The Pi's copy is not a git clone** — it has no remote and no commits. Code
+gets there by rsync, so `git pull` on the Pi does not work. `deploy.sh` writes
+the deployed SHA to `.deployed-commit` on the Pi; that file is the only record
+of what's running:
+
+```bash
+ssh pi@pi.local 'cat /home/pi/ring-local-enhancements/.deployed-commit'
+```
+
+`.env` and `blind-sensor-map.json` live only on the Pi and are never
+transferred or deleted.
+
+```bash
+# logs
+ssh pi@pi.local 'pm2 logs ring-local-enhancements'
+```
+
+`journal-cleaner.timer` stays on systemd — it's a `journalctl --vacuum-time`
+maintenance job, not an app process.
 
 ## Configuration
 
