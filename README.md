@@ -1,6 +1,6 @@
 # Ring local enhancements
 
-Local-network glue for a Ring + IKEA Dirigera home. Two automations in
+Local-network glue for a Ring + IKEA Dirigera home. Four automations in
 one Node service:
 
 1. **Camera snooze on door open** — when a designated Ring Alarm contact
@@ -14,6 +14,59 @@ one Node service:
 3. **Smoke-triggered lock unlock** — when the Ring Alarm panel reports a
    fire or CO alarm (`alarmInfo.state`), unlock an Ultraloq lock via the
    SmartThings REST API. Unlock only — it never re-locks during an alarm.
+4. **Level-sync retry** — when you set the whole house to a level and a few
+   blinds don't respond, re-send the command to just those blinds. Also
+   nudges a fully-open house to 3% closed.
+
+## Level-Sync Retry
+
+Dirigera levels run **0 = fully open, 100 = fully closed**.
+
+A house-wide level command (IKEA app, remote, scene) sometimes fails to
+reach a few blinds. The service watches the hub's event stream, waits for
+the burst of commands to settle, then compares every blind against the
+level the majority landed on and re-sends it to the ones that missed it —
+up to `BLIND_LEVEL_SYNC_MAX_RETRIES` times,
+`BLIND_LEVEL_SYNC_RETRY_DELAY_MS` apart.
+
+Because blinds report `blindsTargetLevel` and `blindsCurrentLevel`
+separately, both failure modes are caught and distinguished in the logs:
+
+- `did-not-move` — the blind got the command but the motor never ran
+  (target matches, current level doesn't).
+- `missed-command` — the blind never heard the command at all (target and
+  current are both stale).
+
+It deliberately does nothing when:
+
+- fewer than `BLIND_LEVEL_SYNC_MIN_BURST` blinds moved together (you were
+  adjusting one blind by hand, not the house);
+- no level holds a `BLIND_LEVEL_SYNC_CONSENSUS_RATIO` majority;
+- more than `BLIND_LEVEL_SYNC_MAX_STRAGGLERS` blinds disagree — that looks
+  like a deliberate partial-house state, not dropped commands;
+- the blind is unreachable, is awaiting a deferred sunset close, or has an
+  open mapped door sensor;
+- the blind was explicitly set to a *different* level during the same burst
+  — it emitted its own event, so it's distinguishable from one that simply
+  missed the command;
+- a sunset close sequence is running (that path does its own retries).
+
+A newer house-wide command supersedes any sync still in flight, so retries
+never fight a fresh instruction.
+
+**Full-open nudge:** when the consensus level is 0 (fully open), the house
+is driven to `BLIND_FULL_OPEN_NUDGE_LEVEL` (default 3 — 3% closed, 97%
+open) instead. The whole house moves on this pass, so the straggler cap
+doesn't apply to it. Set `BLIND_FULL_OPEN_NUDGE=false` to turn it off.
+
+Check what it would do against the live hub, without touching anything:
+
+```bash
+npm run diag
+```
+
+Add `--apply` to actually drive the stragglers it finds. Decision logic is
+unit-tested with `npm test`.
 
 ## How It Works
 
@@ -26,6 +79,10 @@ one Node service:
   schedules the close. After firing, it re-schedules for the next sunset.
 - Open→closed transitions on a guarded sensor start a delay timer; if the
   door reopens within that window, the timer is cancelled.
+- Subscribes to the Dirigera event stream
+  (`startListeningForUpdates`) to notice blind level changes from any
+  source — the IKEA app, a remote, or a scene. Commands the service issues
+  itself are tagged and ignored, so it never reacts to its own writes.
 
 ## Prerequisites
 

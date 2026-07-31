@@ -16,6 +16,7 @@
 import { RingApi, RingDeviceType } from "ring-client-api";
 import { createDirigeraClient } from "dirigera";
 import { createSmartThingsClient } from "./smartthings-lock.mjs";
+import { planLevelSync } from "./level-sync.mjs";
 import SunCalc from "suncalc";
 import { readFileSync, writeFileSync, existsSync } from "fs";
 import { resolve, dirname } from "path";
@@ -72,6 +73,39 @@ const BLIND_CLOSED_LEVEL = 100;
 const BLIND_CLOSE_SPACING_MS = 10 * 1000;
 const RETRY_DELAY_MS = 5 * 60 * 1000;
 const MAX_RETRY_PASSES = 2;
+
+// --- Level-sync retry (stragglers on a house-wide level command) ------------
+// Some blinds intermittently miss a house-wide level command. We watch the
+// Dirigera event stream, wait for the burst of commands to settle, then re-send
+// the consensus level to any blind that didn't land on it.
+const LEVEL_SYNC_ENABLED = (process.env.BLIND_LEVEL_SYNC_ENABLED || "true").toLowerCase() !== "false";
+// Quiet period after the last observed target change before we evaluate.
+const LEVEL_SYNC_SETTLE_MS = parseInt(process.env.BLIND_LEVEL_SYNC_SETTLE_MS || "20000", 10);
+// Hard cap on how long one burst may keep extending the settle window.
+const LEVEL_SYNC_MAX_BURST_MS = parseInt(process.env.BLIND_LEVEL_SYNC_MAX_BURST_MS || "120000", 10);
+const LEVEL_SYNC_RETRY_DELAY_MS = parseInt(process.env.BLIND_LEVEL_SYNC_RETRY_DELAY_MS || "45000", 10);
+const LEVEL_SYNC_MAX_RETRIES = parseInt(process.env.BLIND_LEVEL_SYNC_MAX_RETRIES || "3", 10);
+// Minimum blinds that must move together before we treat it as a house-wide
+// command. Nudging a single blind by hand must never trigger a sync.
+const LEVEL_SYNC_MIN_BURST = parseInt(process.env.BLIND_LEVEL_SYNC_MIN_BURST || "3", 10);
+// If more blinds than this disagree, assume a deliberate partial-house state
+// rather than dropped commands, and stand down.
+const LEVEL_SYNC_MAX_STRAGGLERS = parseInt(process.env.BLIND_LEVEL_SYNC_MAX_STRAGGLERS || "3", 10);
+// Fraction of reachable blinds that must share a target level for it to count
+// as the intended level.
+const LEVEL_SYNC_CONSENSUS_RATIO = parseFloat(process.env.BLIND_LEVEL_SYNC_CONSENSUS_RATIO || "0.667");
+// Blinds rarely land exactly on target; treat within this many points as "there".
+const LEVEL_SYNC_TOLERANCE = parseInt(process.env.BLIND_LEVEL_SYNC_TOLERANCE || "2", 10);
+const LEVEL_SYNC_SPACING_MS = 2 * 1000;
+// How long after we issue a command to ignore the resulting echo events.
+const SELF_COMMAND_ECHO_MS = 90 * 1000;
+
+// --- Full-open nudge --------------------------------------------------------
+// Dirigera levels run 0 = fully open .. 100 = fully closed. When the house is
+// opened all the way we nudge the blinds down a few points instead of leaving
+// them at 0.
+const FULL_OPEN_NUDGE_ENABLED = (process.env.BLIND_FULL_OPEN_NUDGE || "true").toLowerCase() !== "false";
+const FULL_OPEN_NUDGE_LEVEL = parseInt(process.env.BLIND_FULL_OPEN_NUDGE_LEVEL || "3", 10);
 
 // Sunset close order. Blinds whose names don't match any entry here close last,
 // in whatever order Dirigera returned them.
@@ -249,6 +283,11 @@ function maybeSnooze(ringApi, targetCamera) {
 
 let dirigera = null;
 
+// True from the first sunset close until the last retry pass finishes. The
+// level-sync watcher stays out of the way for the duration: that sequence
+// spaces its commands out and runs its own retries, so the two would fight.
+let sunsetSequenceActive = false;
+
 async function connectDirigera() {
   log(`Connecting to Dirigera hub at ${DIRIGERA_HOST}...`);
   dirigera = await createDirigeraClient({
@@ -260,12 +299,38 @@ async function connectDirigera() {
   return blinds;
 }
 
-async function closeBlind(blindId, blindName) {
+// blindId -> timestamp until which target changes are assumed to be echoes of
+// our own writes. Keeps the level-sync watcher from reacting to itself.
+const selfCommanded = new Map();
+
+function markSelfCommanded(blindId) {
+  selfCommanded.set(blindId, Date.now() + SELF_COMMAND_ECHO_MS);
+}
+
+function isSelfCommanded(blindId) {
+  const until = selfCommanded.get(blindId);
+  if (until === undefined) return false;
+  if (Date.now() > until) {
+    selfCommanded.delete(blindId);
+    return false;
+  }
+  return true;
+}
+
+async function setBlindLevel(blindId, blindName, level) {
+  markSelfCommanded(blindId);
   try {
-    await dirigera.blinds.setTargetLevel({ id: blindId, blindsTargetLevel: BLIND_CLOSED_LEVEL });
-    log(`Closed blind "${blindName}"`);
+    await dirigera.blinds.setTargetLevel({ id: blindId, blindsTargetLevel: level });
+    return true;
   } catch (err) {
-    logError(`Failed to close blind "${blindName}"`, err);
+    logError(`Failed to set blind "${blindName}" to level ${level}`, err);
+    return false;
+  }
+}
+
+async function closeBlind(blindId, blindName) {
+  if (await setBlindLevel(blindId, blindName, BLIND_CLOSED_LEVEL)) {
+    log(`Closed blind "${blindName}"`);
   }
 }
 
@@ -377,8 +442,272 @@ async function onSunset(sensors) {
     return;
   }
   log(`Sunset: closing ${toClose.length} blind(s), ${BLIND_CLOSE_SPACING_MS / 1000}s between each: ${toClose.map((b) => b.name).join(" -> ")}`);
-  await closeBlindsSequentially(toClose);
-  retryStillOpen(toClose, 1).catch((err) => logError("Sunset retry pass failed", err));
+  sunsetSequenceActive = true;
+  try {
+    await closeBlindsSequentially(toClose);
+  } catch (err) {
+    logError("Sunset close sequence failed", err);
+  }
+  retryStillOpen(toClose, 1)
+    .catch((err) => logError("Sunset retry pass failed", err))
+    .finally(() => {
+      sunsetSequenceActive = false;
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Level-sync retry
+//
+// A house-wide level command (IKEA app, remote, scene) occasionally fails to
+// reach a few blinds. We watch the Dirigera event stream for a burst of target
+// changes, wait for it to settle, then compare every blind against the level
+// the majority landed on and re-send it to the ones that didn't get there.
+//
+// Two distinct failure modes, both caught:
+//   - the blind got the command but never moved (target == consensus, but
+//     current level is somewhere else)
+//   - the blind never got the command at all (target and current both stale)
+//
+// A blind you deliberately set to a different level during the same burst is
+// left alone: it emitted its own target-change event, so it's distinguishable
+// from one that simply missed the command.
+// ---------------------------------------------------------------------------
+
+// blindId -> target level explicitly commanded during the current burst.
+const burstTargets = new Map();
+let burstSettleTimer = null;
+let burstStartedAt = 0;
+// Promise for the sync currently running, so a newer burst can wait for it to
+// stand down instead of being dropped.
+let levelSyncPromise = null;
+// Bumped whenever a new externally-driven burst begins. An in-flight sync
+// checks it and aborts, so a fresh command from the app always wins over
+// retries still chasing the previous level.
+let burstGeneration = 0;
+
+// Names of this blind's mapped Ring sensors that are currently open.
+function openSensorsForBlind(blindName) {
+  const sensorKeys = findSensorKeysForBlind(blindName);
+  if (!sensorKeys) return [];
+  const open = [];
+  for (const state of sensorState.values()) {
+    if (!state.isOpen) continue;
+    if (sensorKeys.some((k) => nameMatches(state.name, k))) open.push(state.name);
+  }
+  return open;
+}
+
+function levelSyncConfig() {
+  return {
+    tolerance: LEVEL_SYNC_TOLERANCE,
+    consensusRatio: LEVEL_SYNC_CONSENSUS_RATIO,
+    maxStragglers: LEVEL_SYNC_MAX_STRAGGLERS,
+    minBurst: LEVEL_SYNC_MIN_BURST,
+    fullOpenNudgeEnabled: FULL_OPEN_NUDGE_ENABLED,
+    fullOpenNudgeLevel: FULL_OPEN_NUDGE_LEVEL,
+    isPendingClose: (id) => pendingCloses.has(id),
+    openSensorsFor: openSensorsForBlind,
+  };
+}
+
+// Re-check the fences between retry passes -- a door may have opened since.
+function stillEligible(straggler, burst, consensus) {
+  const burstTarget = burst.get(straggler.id);
+  if (burstTarget !== undefined && burstTarget !== consensus) {
+    return `deliberately set to ${burstTarget}`;
+  }
+  if (pendingCloses.has(straggler.id)) return "deferred sunset close pending";
+  const open = openSensorsForBlind(straggler.name);
+  if (open.length > 0) return `open sensor(s): ${open.join(", ")}`;
+  return null;
+}
+
+function atLevel(level, target) {
+  return Math.abs(level - target) <= LEVEL_SYNC_TOLERANCE;
+}
+
+// Sleep in slices so a newer command doesn't have to wait out the full delay
+// before the current sync notices it has been superseded.
+async function sleepUnlessSuperseded(ms, generation) {
+  const step = 2000;
+  for (let waited = 0; waited < ms; waited += step) {
+    if (generation !== burstGeneration) return false;
+    await sleep(Math.min(step, ms - waited));
+  }
+  return generation === burstGeneration;
+}
+
+// `target` is the level to drive to, `commanded` the level the house was
+// actually told to go to (they differ when the full-open nudge applies).
+async function syncStragglers(target, stragglers, burst, commanded, generation) {
+  let remaining = stragglers;
+
+  for (let pass = 1; pass <= LEVEL_SYNC_MAX_RETRIES; pass++) {
+    if (generation !== burstGeneration) {
+      log(`Level sync: superseded by a newer command -- abandoning retries for level ${target}`);
+      return;
+    }
+
+    log(
+      `Level sync attempt ${pass}/${LEVEL_SYNC_MAX_RETRIES}: sending level ${target} to ${remaining.length} blind(s): ${remaining.map((b) => b.name).join(", ")}`
+    );
+    for (let i = 0; i < remaining.length; i++) {
+      await setBlindLevel(remaining[i].id, remaining[i].name, target);
+      if (i < remaining.length - 1) await sleep(LEVEL_SYNC_SPACING_MS);
+    }
+
+    if (!(await sleepUnlessSuperseded(LEVEL_SYNC_RETRY_DELAY_MS, generation))) {
+      log(`Level sync: superseded by a newer command -- abandoning retries for level ${target}`);
+      return;
+    }
+
+    let current;
+    try {
+      current = await dirigera.blinds.list();
+    } catch (err) {
+      logError(`Level sync attempt ${pass}: failed to list blinds, retrying same set`, err);
+      continue;
+    }
+    const byId = new Map(current.map((b) => [b.id, b]));
+
+    const stillOff = [];
+    for (const s of remaining) {
+      const blind = byId.get(s.id);
+      const level = blind?.attributes?.blindsCurrentLevel;
+      if (typeof level !== "number") {
+        log(`Level sync: "${s.name}" has no current-level reading, dropping from this sync`);
+        continue;
+      }
+      if (atLevel(level, target)) continue;
+      const skip = stillEligible(s, burst, commanded);
+      if (skip) {
+        log(`Level sync: dropping "${s.name}" -- ${skip}`);
+        continue;
+      }
+      stillOff.push(s);
+    }
+
+    if (stillOff.length === 0) {
+      log(`Level sync: all blinds reached level ${target} after attempt ${pass}.`);
+      return;
+    }
+    remaining = stillOff;
+  }
+
+  log(
+    `Level sync: gave up after ${LEVEL_SYNC_MAX_RETRIES} attempt(s); still off level ${target}: ${remaining.map((b) => b.name).join(", ")}`
+  );
+}
+
+async function evaluateBurst() {
+  burstSettleTimer = null;
+  const burst = new Map(burstTargets);
+  burstTargets.clear();
+  burstStartedAt = 0;
+
+  // Cheap rejections first, before spending a hub round-trip.
+  if (burst.size < LEVEL_SYNC_MIN_BURST) {
+    log(`Level sync: only ${burst.size} blind(s) commanded, not a house-wide change -- ignoring`);
+    return;
+  }
+  if (sunsetSequenceActive) {
+    log("Level sync: sunset close sequence in progress -- standing down");
+    return;
+  }
+
+  // A sync for an older command is still winding down. Its generation check has
+  // already been tripped, so wait for it rather than dropping this burst.
+  if (levelSyncPromise) {
+    log("Level sync: waiting for the superseded sync to stand down...");
+    try {
+      await levelSyncPromise;
+    } catch (err) {
+      logError("Level sync: previous sync ended badly", err);
+    }
+  }
+
+  let blinds;
+  try {
+    blinds = await dirigera.blinds.list();
+  } catch (err) {
+    logError("Level sync: failed to list blinds", err);
+    return;
+  }
+
+  const plan = planLevelSync(blinds, burst, levelSyncConfig());
+
+  if (plan.skipped?.length) {
+    log(`Level sync: leaving alone -- ${plan.skipped.map((s) => `${s.name} (${s.reason})`).join("; ")}`);
+  }
+  if (plan.action === "ignore") {
+    log(`Level sync: ${plan.reason} -- ignoring`);
+    return;
+  }
+
+  const { consensus, target, nudging, agreeing, candidateCount, stragglers } = plan;
+  if (nudging) {
+    log(`Level sync: house opened fully (level 0) -- nudging to level ${target} (${100 - target}% open)`);
+  }
+  log(
+    `Level sync: house consensus is level ${consensus} (${agreeing}/${candidateCount}); driving ${stragglers.length} blind(s) to level ${target}: ` +
+      stragglers.map((b) => `${b.name} [at ${b.level}, ${b.mode}]`).join(", ")
+  );
+
+  const generation = burstGeneration;
+  levelSyncPromise = syncStragglers(target, stragglers, burst, consensus, generation);
+  try {
+    await levelSyncPromise;
+  } finally {
+    levelSyncPromise = null;
+  }
+}
+
+function noteBlindTargetChange(blindId, target) {
+  const now = Date.now();
+  if (burstTargets.size === 0) {
+    burstStartedAt = now;
+    // New external command: any sync still retrying the old level stands down.
+    burstGeneration++;
+  }
+  burstTargets.set(blindId, target);
+
+  // Debounce until the commands stop arriving, but never defer past the cap --
+  // otherwise a slow trickle of changes could postpone evaluation forever.
+  if (burstSettleTimer) clearTimeout(burstSettleTimer);
+  const remainingBudget = LEVEL_SYNC_MAX_BURST_MS - (now - burstStartedAt);
+  const wait = Math.max(0, Math.min(LEVEL_SYNC_SETTLE_MS, remainingBudget));
+  burstSettleTimer = setTimeout(() => {
+    evaluateBurst().catch((err) => logError("Level sync evaluation failed", err));
+  }, wait);
+}
+
+function onDirigeraEvent(event) {
+  if (event?.type === "termination") {
+    log(`Dirigera event stream termination signal: ${event.data?.signal} (client will reconnect)`);
+    return;
+  }
+  if (event?.type !== "deviceStateChanged") return;
+  if (event.data?.deviceType !== "blinds") return;
+
+  const target = event.data.attributes?.blindsTargetLevel;
+  if (typeof target !== "number") return;
+  if (isSelfCommanded(event.data.id)) return;
+
+  noteBlindTargetChange(event.data.id, target);
+}
+
+function startLevelSyncWatch() {
+  dirigera.startListeningForUpdates((event) => {
+    try {
+      onDirigeraEvent(event);
+    } catch (err) {
+      logError("Dirigera event handler failed", err);
+    }
+  });
+  log(
+    `Level-sync retry active: ${LEVEL_SYNC_MAX_RETRIES} attempt(s), ${LEVEL_SYNC_RETRY_DELAY_MS / 1000}s apart, ` +
+      `settle ${LEVEL_SYNC_SETTLE_MS / 1000}s, min burst ${LEVEL_SYNC_MIN_BURST}, max ${LEVEL_SYNC_MAX_STRAGGLERS} straggler(s)`
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -782,6 +1111,8 @@ async function main() {
     try {
       await connectDirigera();
       scheduleSunset(sensors);
+      if (LEVEL_SYNC_ENABLED) startLevelSyncWatch();
+      else log("Level-sync retry disabled (BLIND_LEVEL_SYNC_ENABLED=false)");
     } catch (err) {
       logError("Dirigera setup failed -- blind automation disabled this run", err);
     }
@@ -794,8 +1125,14 @@ async function main() {
 // Lifecycle
 // ---------------------------------------------------------------------------
 
-process.on("SIGINT", () => { log("Shutting down (SIGINT)..."); process.exit(0); });
-process.on("SIGTERM", () => { log("Shutting down (SIGTERM)..."); process.exit(0); });
+function shutdown(signal) {
+  log(`Shutting down (${signal})...`);
+  try { dirigera?.stopListeningForUpdates(); } catch (_) {}
+  process.exit(0);
+}
+
+process.on("SIGINT", () => shutdown("SIGINT"));
+process.on("SIGTERM", () => shutdown("SIGTERM"));
 process.on("unhandledRejection", (err) => logError("Unhandled rejection", err));
 
 main().catch((err) => {

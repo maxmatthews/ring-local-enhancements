@@ -1,5 +1,13 @@
 # ring-local-enhancements
 
+## Checks
+
+- `npm test` — unit tests for the level-sync decision logic
+  (`level-sync.mjs`). Pure and offline; run before deploying.
+- `npm run diag` — read-only report of live blind levels and what the
+  level-sync logic would decide. Needs LAN access to the Dirigera hub, so
+  run it on the Pi. `--apply` makes it act.
+
 ## Deployment
 
 - Runs on a Raspberry Pi reachable at `pi.local` (user `pi`).
