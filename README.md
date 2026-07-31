@@ -1,39 +1,129 @@
 # Ring local enhancements
 
-Local-network glue for a Ring + IKEA Dirigera home. Four automations in
-one Node service:
+Local-network glue for a Ring + IKEA Dirigera home. One Node service
+(`index.mjs`) running four automations that neither vendor offers natively:
 
-1. **Camera snooze on door open** — when a designated Ring Alarm contact
-   sensor opens, silence "Person Detected" notifications on a Ring camera
-   for a while (video keeps recording). Stops the flood of notifications
-   every time you walk in or out.
-2. **Sunset blind close, gated by door state** — at local sunset, close
-   every IKEA Dirigera blind. Skip any blind whose mapped contact sensor
-   is currently open; close it `POST_CLOSE_DELAY_SECONDS` after the sensor
-   reports closed. Blinds with no mapping always close.
-3. **Smoke-triggered lock unlock** — when the Ring Alarm panel reports a
-   fire or CO alarm (`alarmInfo.state`), unlock an Ultraloq lock via the
-   SmartThings REST API. Unlock only — it never re-locks during an alarm.
-4. **Level-sync retry** — when you set the whole house to a level and a few
-   blinds don't respond, re-send the command to just those blinds. Also
-   nudges a fully-open house to 3% closed.
+| # | Feature | Needs | Off switch |
+| --- | --- | --- | --- |
+| 1 | **Camera snooze on door open** — mute "Person Detected" notifications on a Ring camera when a door opens (video keeps recording) | Ring only | always on |
+| 2 | **Sunset blind close, gated by door state** — close every Dirigera blind at local sunset, but not while its mapped door is open | Ring + Dirigera | omit any `DIRIGERA_*` / `LATITUDE` / `LONGITUDE` |
+| 3 | **Smoke/CO auto-unlock** — unlock an Ultraloq lock via SmartThings when the Ring Alarm panel reports a fire or CO alarm | Ring + SmartThings | omit any `ST_*` |
+| 4 | **Level-sync retry** — re-send a house-wide blind level to the blinds that missed it, plus a full-open nudge | Ring + Dirigera | `BLIND_LEVEL_SYNC_ENABLED=false` |
 
-## Level-Sync Retry
+Each feature degrades independently: missing config disables just that
+feature and logs why at startup, and a setup failure (Dirigera unreachable,
+SmartThings credentials rejected) disables that feature for the run while
+everything else keeps working.
+
+---
+
+## 1. Camera snooze on door open
+
+When the contact sensor matching `DOOR_SENSOR_NAME` transitions to open, the
+service PATCHes the target camera's device settings so human detection stays
+**enabled and recording** but stops notifying:
+
+```
+cv_settings.detection_types.human = { enabled: true, mode: "edge", notification: false }
+```
+
+`SNOOZE_MINUTES` later a timer restores `notification: true`. A repeat trigger
+inside `COOLDOWN_SECONDS` is ignored; a repeat trigger after that restarts the
+window (the pending re-enable timer is replaced, not stacked).
+
+This stops the notification flood every time you walk in or out, without
+losing the footage.
+
+## 2. Sunset blind close, gated by door state
+
+At local sunset (computed from `LATITUDE` / `LONGITUDE` with `suncalc`) the
+service lists every Dirigera blind and sorts them into two groups:
+
+- **Close now** — blinds with no mapping, blinds whose mapping doesn't resolve
+  to a real sensor (logged as `WARN:`), and blinds whose mapped sensors are
+  all closed.
+- **Defer** — blinds with at least one mapped sensor currently open.
+
+The close-now group is driven **sequentially**, `10s` apart, in the room order
+listed in `CLOSE_ORDER` (top of `index.mjs`). Blinds whose names match no entry
+close last. Spacing them out keeps the hub from dropping commands under a burst.
+
+A deferred blind closes `POST_CLOSE_DELAY_SECONDS` after **all** of its mapped
+sensors report closed — the delay is the grace period to shut the door behind
+you. If any mapped sensor reopens during that window, the timer is cancelled
+and the wait restarts on the next close. If the delay would fire after sunrise,
+the close is abandoned instead (no blind drops in the morning because a door
+was open all night).
+
+**Sunset retry:** after the close sequence, the service re-lists the blinds
+`5min` later and re-sends the close to any that aren't at level 100 — up to
+2 passes.
+
+After a sunset fires, the next one is re-computed and scheduled, so the service
+runs indefinitely without a cron.
+
+> Disable any sunset-blind scene or automation in the IKEA Home Smart app.
+> Otherwise the Dirigera hub closes blinds on its own schedule and this
+> service's door guard does nothing.
+
+## 3. Smoke/CO auto-unlock (SmartThings)
+
+When a fire or CO alarm is detected, the service sends an **unlock** command to
+the Ultraloq lock through the SmartThings REST API. Unlock only — it never
+re-locks during an alarm; you relock manually once it's clear.
+
+**Detection is panel-first.** The canonical signal is the Ring Alarm security
+panel's `alarmInfo.state`, matched against:
+
+`fire-alarm` · `co-alarm` · `user-verified-co-or-fire-alarm` · `fire-accelerated-alarm`
+
+Watching the panel catches *any* smoke/CO detector on the hub at once.
+Individual detectors are watched as a **backup** path: any smoke/CO device
+(matched by device type, a type-name pattern, or a name containing "smoke" /
+"carbon monoxide") is subscribed, and an `active` status in `alarmStatus`,
+`smoke.alarmStatus`, `co.alarmStatus`, or the Bluejay-style
+`components["alarm.smoke"|"alarm.co"]` blocks (including `lowLevelAlarmStatus`)
+triggers an unlock. End-of-life warnings and `pushToTest` self-tests are
+deliberately ignored.
+
+Both paths are also evaluated once at startup, so a service restart during a
+live alarm still unlocks.
+
+**Unlock delivery:** up to 5 attempts, 3s apart. The
+`SMOKE_UNLOCK_COOLDOWN_SECONDS` cooldown starts only after a **successful**
+unlock — if all attempts fail, no cooldown is set and the next alarm update
+re-triggers, so an ongoing alarm keeps retrying in bursts. An in-progress guard
+prevents the panel and a device firing simultaneously from sending overlapping
+commands.
+
+Every panel `alarmInfo.state` transition is logged, alarm or not, so a real
+event leaves an audit trail.
+
+> **This is a life-safety supplement, not a replacement.** Anyone inside can
+> always egress via the thumb-turn; the auto-unlock mainly helps responders get
+> in. It's a cloud path — but so is the Ring smoke *trigger* (the hub event
+> arrives over Ring's cloud), so both halves already depend on the internet; a
+> local unlock would not change that. The only fully-local alternative for
+> *both* halves would be different detection plus a Z-Wave lock.
+
+## 4. Level-sync retry
 
 Dirigera levels run **0 = fully open, 100 = fully closed**.
 
-A house-wide level command (IKEA app, remote, scene) sometimes fails to
-reach a few blinds. The service watches the hub's event stream, waits for
-the burst of commands to settle, then compares every blind against the
-level the majority landed on and re-sends it to the ones that missed it —
-up to `BLIND_LEVEL_SYNC_MAX_RETRIES` times,
-`BLIND_LEVEL_SYNC_RETRY_DELAY_MS` apart.
+A house-wide level command (IKEA app, remote, scene) sometimes fails to reach a
+few blinds. The service subscribes to the hub's event stream, collects the
+burst of `blindsTargetLevel` changes, waits `BLIND_LEVEL_SYNC_SETTLE_MS` for it
+to go quiet (never deferring past `BLIND_LEVEL_SYNC_MAX_BURST_MS`), then
+compares every blind against the level the majority landed on and re-sends it
+to the ones that missed — up to `BLIND_LEVEL_SYNC_MAX_RETRIES` times,
+`BLIND_LEVEL_SYNC_RETRY_DELAY_MS` apart, re-listing the blinds between passes
+and dropping the ones that arrived.
 
-Because blinds report `blindsTargetLevel` and `blindsCurrentLevel`
-separately, both failure modes are caught and distinguished in the logs:
+Because blinds report `blindsTargetLevel` and `blindsCurrentLevel` separately,
+both failure modes are caught and distinguished in the logs:
 
-- `did-not-move` — the blind got the command but the motor never ran
-  (target matches, current level doesn't).
+- `did-not-move` — the blind got the command but the motor never ran (target
+  matches, current level doesn't).
 - `missed-command` — the blind never heard the command at all (target and
   current are both stale).
 
@@ -41,55 +131,91 @@ It deliberately does nothing when:
 
 - fewer than `BLIND_LEVEL_SYNC_MIN_BURST` blinds moved together (you were
   adjusting one blind by hand, not the house);
-- no level holds a `BLIND_LEVEL_SYNC_CONSENSUS_RATIO` majority;
-- more than `BLIND_LEVEL_SYNC_MAX_STRAGGLERS` blinds disagree — that looks
-  like a deliberate partial-house state, not dropped commands;
-- the blind is unreachable, is awaiting a deferred sunset close, or has an
-  open mapped door sensor;
-- the blind was explicitly set to a *different* level during the same burst
-  — it emitted its own event, so it's distinguishable from one that simply
-  missed the command;
+- no level holds a `BLIND_LEVEL_SYNC_CONSENSUS_RATIO` majority of reachable
+  blinds;
+- more than `BLIND_LEVEL_SYNC_MAX_STRAGGLERS` blinds disagree — that looks like
+  a deliberate partial-house state, not dropped commands;
+- the blind is unreachable or hidden, reports no current level, is awaiting a
+  deferred sunset close, or has an open mapped door sensor;
+- the blind was explicitly set to a *different* level during the same burst —
+  it emitted its own event, so it's distinguishable from one that simply missed
+  the command;
 - a sunset close sequence is running (that path does its own retries).
 
-A newer house-wide command supersedes any sync still in flight, so retries
-never fight a fresh instruction.
+The door-sensor, pending-close and deliberately-set-apart fences are re-checked
+**between** retry passes, not just up front, so a door opened mid-sync drops
+that blind from the remaining passes.
 
-**Full-open nudge:** when the consensus level is 0 (fully open), the house
-is driven to `BLIND_FULL_OPEN_NUDGE_LEVEL` (default 3 — 3% closed, 97%
-open) instead. The whole house moves on this pass, so the straggler cap
-doesn't apply to it. Set `BLIND_FULL_OPEN_NUDGE=false` to turn it off.
+Landing within `BLIND_LEVEL_SYNC_TOLERANCE` points of the target counts as
+arrived.
 
-Check what it would do against the live hub, without touching anything:
+**Superseding.** Every new externally-driven burst bumps a generation counter.
+An in-flight sync checks it before each pass and between sleep slices, and
+stands down as soon as a fresh command arrives — retries never fight a newer
+instruction. If a burst arrives while the previous sync is still winding down,
+it waits for that one to finish rather than being dropped.
+
+**Self-command suppression.** Commands the service issues are tagged for
+`90s`, and target changes on tagged blinds are ignored, so the service never
+reacts to its own writes.
+
+**Full-open nudge:** when the consensus level is 0 (fully open), the house is
+driven to `BLIND_FULL_OPEN_NUDGE_LEVEL` (default 3 — 3% closed, 97% open)
+instead. The whole house moves on this pass, so the straggler cap doesn't apply
+to it. Set `BLIND_FULL_OPEN_NUDGE=false` to turn it off.
+
+### Diagnosing it against the live hub
 
 ```bash
 npm run diag
 ```
 
-Add `--apply` to actually drive the stragglers it finds. Decision logic is
-unit-tested with `npm test`.
+Read-only. Prints every blind's current level, target level, battery and
+reachability, then runs the **real** decision logic (`level-sync.mjs`) over the
+live snapshot and reports the verdict, the consensus, what it would leave alone
+and why, and which blinds didn't respond. Add `--apply` to actually drive the
+stragglers it finds.
 
-## How It Works
+Caveat: the running service builds its burst from live hub events, which is how
+it tells a blind that *missed* a command from one you deliberately set apart.
+After the fact that distinction is gone, so the diag reconstructs the burst as
+"every blind already sitting on the majority target" — a blind you deliberately
+set differently shows up as a straggler there even though the live service
+would leave it alone.
 
-- Connects to Ring via `ring-client-api` using your refresh token, and to
-  the Dirigera hub via the `dirigera` package using a paired access token.
+The decision logic is pure and I/O-free, and unit-tested with `npm test`
+(17 cases covering both failure modes, every safety valve, and the full-open
+nudge). Both the service and the diag call the same function.
+
+---
+
+## How it works
+
+- Connects to Ring via `ring-client-api` using a refresh token, and to the
+  Dirigera hub via the `dirigera` package using a paired access token.
 - Subscribes to real-time state changes on every contact sensor named in
   `DOOR_SENSOR_NAME` (snooze trigger) or in `blind-sensor-map.json` (blind
-  guard).
-- Computes local sunset from your latitude/longitude with `suncalc` and
-  schedules the close. After firing, it re-schedules for the next sunset.
-- Open→closed transitions on a guarded sensor start a delay timer; if the
-  door reopens within that window, the timer is cancelled.
-- Subscribes to the Dirigera event stream
-  (`startListeningForUpdates`) to notice blind level changes from any
-  source — the IKEA app, a remote, or a scene. Commands the service issues
-  itself are tagged and ignored, so it never reacts to its own writes.
+  guard). Other sensors are ignored.
+- Subscribes to the Ring Alarm security panel and every smoke/CO device for the
+  fire/CO unlock path.
+- Computes local sunset with `suncalc` and schedules the close, re-scheduling
+  after each firing.
+- Subscribes to the Dirigera event stream (`startListeningForUpdates`) to
+  notice blind level changes from any source — the IKEA app, a remote, or a
+  scene.
+- Hub connection is retried 3 times with a 30s timeout per attempt before the
+  process gives up and exits (pm2 restarts it). Dirigera stream terminations
+  are logged; the client reconnects itself.
+- `SIGINT` / `SIGTERM` stop the Dirigera listener and exit cleanly; unhandled
+  rejections are logged rather than fatal.
 
 ## Prerequisites
 
 - Node.js 20+ (`ring-client-api` is ESM-only and dropped Node 18)
-- A Ring account with 2FA enabled, a Ring Alarm hub, and at least one
-  contact sensor
-- An IKEA Dirigera hub on the same LAN as this service (blind feature only)
+- A Ring account with 2FA enabled, a Ring Alarm hub, and at least one contact
+  sensor
+- An IKEA Dirigera hub on the same LAN as this service (features 2 and 4)
+- A lock linked into SmartThings (feature 3)
 
 ## Setup
 
@@ -116,21 +242,17 @@ cp .env.example .env
 # Edit .env -- paste Ring refresh token, Dirigera host + token, your
 # latitude/longitude, and sensor/camera names.
 
-# Mapping (optional but the whole point of feature #2)
+# Blind -> sensor mapping (optional, but the whole point of feature 2)
 cp blind-sensor-map.json.example blind-sensor-map.json
-# Edit it. Keys = Dirigera blind name substring. Values = Ring sensor
-# name substring. Both match case-insensitively. Blinds not listed close
-# unconditionally at sunset.
 ```
 
-**Important:** disable any sunset-blind scene/automation in the IKEA
-Home Smart app. Otherwise the Dirigera hub will close blinds on its own
-schedule and this service's guard does nothing.
+SmartThings pairing is a separate flow — see
+[Smoke-unlock setup](#smoke-unlock-setup-smartthings) below.
 
-## Finding Your Device Names
+### Finding your device names
 
-On first run the service logs the cameras, blinds, and contact sensors it
-discovers. Run it once and copy names from the output:
+On first run the service logs the cameras, blinds, contact sensors, smoke/CO
+devices and panel it discovers. Run it once and copy names from the output:
 
 ```bash
 npm start
@@ -144,19 +266,35 @@ Target camera: "Front Door"
 Connected. Got 25 devices.
 Watching: "Front Door" (open=false)
 Watching: "Left Living Room Window" (open=true)
+Watching smoke/CO device: "Hallway Smoke" (alarm.smoke, alarmActive=false)
+Watching security panel "Alarm Panel" for fire/CO alarm (alarmInfo.state=none)
 Dirigera connected. 3 blind(s): Living Room Left, Kitchen Left, Bedroom Center
-Next sunset: 2026-06-03T00:38:12.408Z (in 174min)
+Next sunset: 2026-08-01T00:38:12.408Z (in 174min)
+Level-sync retry active: 3 attempt(s), 45s apart, settle 20s, min burst 3, max 3 straggler(s)
 Automation active.
 ```
 
-Name matching is case-insensitive partial — `front` matches `Front Door`.
-Any mapping entry that doesn't resolve to a real sensor or blind is
-logged with a `WARN:` line at startup.
+Name matching everywhere is **case-insensitive partial** — `front` matches
+`Front Door`. Any mapping entry that doesn't resolve to a real sensor or blind
+is logged with a `WARN:` line at startup.
+
+## Commands
+
+| Command | What it does |
+| --- | --- |
+| `npm start` | Run the service in the foreground |
+| `npm test` | Unit tests for the level-sync decision logic. Pure and offline. |
+| `npm run diag` | Read-only live report of blind levels + what level-sync would do (`--apply` to act). Needs LAN access to the hub — run it on the Pi. |
+| `npm run deploy` | Deploy to the Pi (`--dry-run`, `--prune`) |
+| `npm run auth` | Mint a Ring refresh token (interactive 2FA) |
+| `npm run pair-dirigera` | Pair with the Dirigera hub |
+| `npm run pair-smartthings` | One-time SmartThings OAuth pairing; prints the refresh token and device list |
 
 ## Deploying
 
-The service runs on a Raspberry Pi under pm2 (`ecosystem.config.cjs`). Deploy
-from your dev machine:
+The service runs on a Raspberry Pi under pm2 (`ecosystem.config.cjs`:
+autorestart, single instance, 500M memory ceiling), inside the pi user's pm2
+daemon (`pm2-pi.service`). Deploy from your dev machine:
 
 ```bash
 npm run deploy
@@ -164,16 +302,26 @@ npm run deploy
 
 `./deploy.sh --dry-run` shows what would change without touching the Pi;
 `--prune` also removes Pi files that are no longer in the repo. Override the
-target with `PI_HOST=pi@192.168.1.104 ./deploy.sh`.
+target with `PI_HOST=pi@192.168.1.104 ./deploy.sh` (also `PI_DIR`, `PM2_APP`).
 
-The script refuses to run on a dirty working tree, runs the tests locally and
-again on the Pi, restarts pm2, and fails loudly if the app doesn't come back
-online. It prints a rollback command on success.
+The script:
+
+1. refuses to run on a dirty working tree (untracked files count — they'd be
+   rsynced, which would make the stamped commit a lie);
+2. warns if the commit isn't on the remote;
+3. runs the tests locally;
+4. checks the Pi is reachable and reports what's currently deployed;
+5. rsyncs, excluding `.git`, `node_modules`, `.env`, `.env.pi.bak`,
+   `blind-sensor-map.json`, `.DS_Store`, `scratchpad`;
+6. runs `npm ci` **and the tests again on the Pi** (different arch and Node
+   build — a green run locally proves nothing about there);
+7. stamps `.deployed-commit`, restarts pm2, `pm2 save`;
+8. verifies the app came back `online` and fails loudly if not;
+9. prints recent logs and a rollback command.
 
 **The Pi's copy is not a git clone** — it has no remote and no commits. Code
-gets there by rsync, so `git pull` on the Pi does not work. `deploy.sh` writes
-the deployed SHA to `.deployed-commit` on the Pi; that file is the only record
-of what's running:
+gets there by rsync, so `git pull` on the Pi does not work and never has.
+`.deployed-commit` is the only record of what's running:
 
 ```bash
 ssh pi@pi.local 'cat /home/pi/ring-local-enhancements/.deployed-commit'
@@ -183,46 +331,100 @@ ssh pi@pi.local 'cat /home/pi/ring-local-enhancements/.deployed-commit'
 transferred or deleted.
 
 ```bash
-# logs
 ssh pi@pi.local 'pm2 logs ring-local-enhancements'
 ```
 
-`journal-cleaner.timer` stays on systemd — it's a `journalctl --vacuum-time`
-maintenance job, not an app process.
+`journal-cleaner.timer` / `journal-cleaner.service` stay on systemd — a daily
+`journalctl --vacuum-time=14d` maintenance job, not an app process, so it
+doesn't fit the pm2 model.
 
 ## Configuration
 
 ### .env
 
+Loaded from the project directory at startup. Real environment variables win
+over `.env` values, so you can override any of these on the command line.
+
+**Ring (required)**
+
 | Variable | Default | Description |
 | --- | --- | --- |
-| `RING_REFRESH_TOKEN` | (required) | Token from `npm run auth` |
+| `RING_REFRESH_TOKEN` | (required) | Token from `npm run auth`. Auto-rotated in place. |
 | `DOOR_SENSOR_NAME` | `Front Door` | Sensor that triggers camera snooze |
 | `CAMERA_NAME` | `Front Door` | Camera to snooze |
 | `SNOOZE_MINUTES` | `30` | Snooze duration |
 | `COOLDOWN_SECONDS` | `60` | Min gap between snooze triggers |
-| `DIRIGERA_HOST` | (optional) | Dirigera hub IP. Omit to disable blind feature. |
+
+**Dirigera blinds** — if any of the four are missing, features 2 and 4 stay off.
+
+| Variable | Default | Description |
+| --- | --- | --- |
+| `DIRIGERA_HOST` | (optional) | Dirigera hub IP |
 | `DIRIGERA_TOKEN` | (optional) | Access token from `npm run pair-dirigera` |
 | `LATITUDE` | (optional) | Decimal degrees, for sunset calc |
 | `LONGITUDE` | (optional) | Decimal degrees, for sunset calc |
-| `BLIND_SENSOR_MAP_FILE` | `blind-sensor-map.json` | Mapping file path |
-| `POST_CLOSE_DELAY_SECONDS` | `60` | Delay between sensor-close and blind-close |
-| `ST_CLIENT_ID` | (optional) | SmartThings OAuth2 client ID. Omit to disable smoke-unlock. |
-| `ST_CLIENT_SECRET` | (optional) | SmartThings OAuth2 client secret |
-| `ST_REFRESH_TOKEN` | (optional) | Refresh token from `npm run pair-smartthings` (auto-rotated) |
-| `ST_LOCK_DEVICE_ID` | (optional) | SmartThings device ID of the lock to unlock |
-| `SMOKE_UNLOCK_COOLDOWN_SECONDS` | `300` | Min gap between unlock commands |
+| `BLIND_SENSOR_MAP_FILE` | `blind-sensor-map.json` | Mapping file path, relative to the project dir |
+| `POST_CLOSE_DELAY_SECONDS` | `60` | Delay between last mapped sensor closing and the blind closing |
 
-If any of `DIRIGERA_HOST`, `DIRIGERA_TOKEN`, `LATITUDE`, `LONGITUDE` are
-missing, the blind feature stays off and the service still does the
-camera snooze. Likewise, if any of the four required `ST_*` values are
-missing, the smoke-unlock stays off and the rest keeps running.
+**Level-sync retry**
 
-### Smoke-triggered unlock (SmartThings)
+| Variable | Default | Description |
+| --- | --- | --- |
+| `BLIND_LEVEL_SYNC_ENABLED` | `true` | Master switch (`false` disables) |
+| `BLIND_LEVEL_SYNC_SETTLE_MS` | `20000` | Quiet period after the last observed change before evaluating |
+| `BLIND_LEVEL_SYNC_MAX_BURST_MS` | `120000` | Hard cap on how long one burst may keep extending the settle window |
+| `BLIND_LEVEL_SYNC_MAX_RETRIES` | `3` | Retry passes |
+| `BLIND_LEVEL_SYNC_RETRY_DELAY_MS` | `45000` | Gap between passes |
+| `BLIND_LEVEL_SYNC_MIN_BURST` | `3` | Min blinds moving together to count as house-wide |
+| `BLIND_LEVEL_SYNC_MAX_STRAGGLERS` | `3` | Above this, assume a deliberate partial-house state and stand down |
+| `BLIND_LEVEL_SYNC_CONSENSUS_RATIO` | `0.667` | Fraction of reachable blinds that must share a target level |
+| `BLIND_LEVEL_SYNC_TOLERANCE` | `2` | Points of slack counted as "arrived" |
+| `BLIND_FULL_OPEN_NUDGE` | `true` | Nudge a fully-open house off 0 |
+| `BLIND_FULL_OPEN_NUDGE_LEVEL` | `3` | Level to nudge to (3 = 3% closed) |
+
+**SmartThings smoke-unlock** — if any of the four required values are missing,
+feature 3 stays off.
+
+| Variable | Default | Description |
+| --- | --- | --- |
+| `ST_CLIENT_ID` | (optional) | OAuth2 client ID from `smartthings apps:create` |
+| `ST_CLIENT_SECRET` | (optional) | OAuth2 client secret |
+| `ST_REFRESH_TOKEN` | (optional) | From `npm run pair-smartthings`. Rotates on every refresh; auto-persisted. |
+| `ST_LOCK_DEVICE_ID` | (optional) | SmartThings device ID of the lock |
+| `SMOKE_UNLOCK_COOLDOWN_SECONDS` | `300` | Min gap between successful unlocks |
+| `ST_REDIRECT_URI` | `https://httpbin.org/get` | Only used by `npm run pair-smartthings`; must be public HTTPS and match the OAuth app exactly |
+
+Non-`.env` knobs live at the top of `index.mjs`: `CLOSE_ORDER` (sunset close
+order), `BLIND_CLOSED_LEVEL`, close spacing, sunset retry timing, and the
+self-command echo window.
+
+### blind-sensor-map.json
+
+Keys are partial substrings of Dirigera blind names; values are partial
+substrings of Ring contact sensor names. Both sides match case-insensitively.
+A value may be a single name or an **array** — with an array, the blind only
+closes once **all** listed sensors are closed. Keys starting with `_` are
+ignored, so you can keep comments in the file. Blinds not listed always close
+at sunset.
+
+```json
+{
+  "_comment": "Kitchen Center has two windows; both must be shut.",
+  "Living Room Blind": "Front Door",
+  "Kitchen Blind": "Back Door",
+  "Kitchen Center Blind": ["Left Kitchen Window", "Right Kitchen Window"]
+}
+```
+
+If the file is missing, all blinds close unconditionally at sunset. If it's
+malformed, it's logged and treated as empty.
+
+### Smoke-unlock setup (SmartThings)
 
 The Ultraloq lock is linked into **SmartThings** (cloud-to-cloud), and this
 drives it through the official SmartThings REST API. First create an
-**OAuth-In app** with the [SmartThings CLI](https://github.com/SmartThingsCommunity/smartthings-cli):
+**OAuth-In app** with the
+[SmartThings CLI](https://github.com/SmartThingsCommunity/smartthings-cli):
 
 ```bash
 smartthings apps:create
@@ -233,10 +435,10 @@ smartthings apps:create
 ```
 
 **Redirect URI must be public HTTPS.** SmartThings returns a 403 on the
-authorize page for `http://localhost` URIs, so the pairing uses a public
-HTTPS redirect that just displays the code. `https://httpbin.org/get` works
-(it echoes the `?code=` back); anything public+HTTPS that lets you read the
-address bar is fine. It must match `ST_REDIRECT_URI` exactly.
+authorize page for `http://localhost` URIs, so the pairing uses a public HTTPS
+redirect that just displays the code. `https://httpbin.org/get` works (it echoes
+the `?code=` back); anything public + HTTPS that lets you read the address bar
+is fine. It must match `ST_REDIRECT_URI` exactly.
 
 `apps:create` prints an **OAuth Client Id** and **OAuth Client Secret** (the
 secret is shown only once). Then, **on a machine with a browser**, mint a
@@ -247,86 +449,99 @@ ST_CLIENT_ID=xxx ST_CLIENT_SECRET=yyy npm run pair-smartthings
 ```
 
 It opens the consent screen; after you approve, the browser lands on the
-redirect URL with `?code=...`. Paste that code (or the whole URL) at the
-prompt. It exchanges it, prints an `ST_REFRESH_TOKEN`, and lists your devices
+redirect URL with `?code=...`. Paste that code (or the whole URL) at the prompt.
+It exchanges the code, prints an `ST_REFRESH_TOKEN`, and lists your devices
 (locks flagged `* LOCK`). Copy `ST_CLIENT_ID`, `ST_CLIENT_SECRET`,
 `ST_REFRESH_TOKEN`, and the lock's `ST_LOCK_DEVICE_ID` into the Pi's `.env`.
 
-**This is a life-safety supplement, not a replacement.** Anyone inside can
-always egress via the thumb-turn; the auto-unlock mainly helps responders
-get in. It's a cloud path — but so is the Ring smoke *trigger* (the hub
-event arrives over Ring's cloud), so both halves already depend on the
-internet; a local unlock would not change that. The only fully-local
-alternative for *both* halves would be different detection + a Z-Wave lock.
+## Token refresh
 
-### blind-sensor-map.json
+Ring refresh tokens rotate. The service writes the updated token back to `.env`
+automatically (`onRefreshTokenUpdated`). The Dirigera access token does not
+rotate.
 
-```json
-{
-  "Living Room Blind": "Front Door",
-  "Kitchen Blind": "Back Door"
-}
-```
+SmartThings access tokens last 24h and are refreshed 2 minutes before expiry.
+Refresh tokens rotate on **every** refresh and expire after ~30 days if unused;
+the service persists each rotated `ST_REFRESH_TOKEN` back to `.env`, validates
+the credentials once at startup (so a bad token is a startup error, not a
+surprise mid-alarm), and refreshes on a 12-hour keepalive so the token stays
+alive and an unlock never waits on a cold refresh. If the service is stopped
+for more than ~30 days, re-run `npm run pair-smartthings`.
 
-Keys are partial substrings of Dirigera blind names. Values are partial
-substrings of Ring contact sensor names. Both sides match
-case-insensitively. Blinds not listed always close at sunset.
+## Repo layout
 
-## Token Refresh
+| File | Role |
+| --- | --- |
+| `index.mjs` | The service: all four automations, config, lifecycle |
+| `level-sync.mjs` | Pure decision logic for the level-sync retry (`planLevelSync`) |
+| `test-level-sync.mjs` | Unit tests for the above (`npm test`) |
+| `diag-level-sync.mjs` | Live read-only diagnostic (`npm run diag`) |
+| `smartthings-lock.mjs` | SmartThings OAuth2 + lock/unlock/list-devices client |
+| `pair-smartthings.mjs` | One-time SmartThings OAuth pairing helper |
+| `deploy.sh` | rsync + test + pm2 restart deploy to the Pi |
+| `ecosystem.config.cjs` | pm2 app definition |
+| `journal-cleaner.{service,timer}` | systemd journal vacuum, 14-day retention |
+| `.env.example`, `blind-sensor-map.json.example` | Tracked templates |
 
-Ring refresh tokens rotate. The service writes the updated token back to
-`.env` automatically (`onRefreshTokenUpdated`). The Dirigera access token
-does not rotate.
-
-SmartThings refresh tokens also rotate — on **every** refresh — and expire
-after ~30 days if unused. The service persists each rotated `ST_REFRESH_TOKEN`
-back to `.env`, and refreshes on a 12-hour keepalive so the token stays alive
-(and an unlock never waits on a cold refresh) even if no alarm fires for weeks.
-If the service is stopped for more than ~30 days, re-run `npm run
-pair-smartthings` to mint a fresh token.
+`.env`, `.env.pi.bak` and `blind-sensor-map.json` are gitignored and exist only
+where they're used. Never put real secrets in `.env.example`.
 
 ## Caveats
 
-- **Unofficial Ring API**: `ring-client-api` is community-maintained. Ring
-  can break it any time with backend changes.
-- **Snooze scope**: `motion_snooze` suppresses alerts for the calling
-  session. In practice it also seems to suppress push notifications
-  app-wide for that camera, but YMMV.
-- **Network requirement**: needs persistent outbound to
-  `mtalk.google.com:5228` (FCM) for real-time Ring push, and LAN access
-  to the Dirigera hub.
-- **Blind direction**: this assumes `blindsTargetLevel: 100` = closed
-  (rolled down), which matches FYRTUR/KADRILJ defaults. If yours go the
-  other way, flip `BLIND_CLOSED_LEVEL` in `index.mjs`.
+- **Unofficial Ring API**: `ring-client-api` is community-maintained. Ring can
+  break it any time with backend changes.
+- **Snooze survives a restart as "off"**: the re-enable is an in-memory timer.
+  If the service restarts inside a snooze window, that camera's Person
+  notifications stay disabled until a later snooze cycle completes. Re-enable
+  them in the Ring app if you notice it.
+- **Snooze scope**: the setting is on the camera itself, so the mute applies to
+  everyone on the account, not just this session.
+- **Network requirement**: needs persistent outbound to `mtalk.google.com:5228`
+  (FCM) for real-time Ring push, LAN access to the Dirigera hub, and outbound
+  HTTPS to `api.smartthings.com`.
+- **Blind direction**: assumes `blindsTargetLevel: 100` = closed (rolled down),
+  which matches FYRTUR/KADRILJ defaults. If yours go the other way, flip
+  `BLIND_CLOSED_LEVEL` in `index.mjs`.
 - **SmartThings unlock is cloud + best-effort**: it goes through the
-  SmartThings (and U-tec) cloud, so it depends on internet + service uptime
+  SmartThings (and U-tec) cloud, so it depends on internet and service uptime
   and can't be guaranteed during a fire. The same is true of the Ring smoke
-  trigger, so this doesn't add a dependency the detection side didn't
-  already have.
-- **Detection is panel-based**: the primary trigger is the Ring Alarm
-  panel's `alarmInfo.state` (`fire-alarm` / `co-alarm` / the user-verified
-  and accelerated fire-CO variants). Individual smoke/CO detectors were
-  observed *not* to flip their own `alarmStatus` in the data shadow (the
-  Bluejay signals via `pushToTest`/impulses; the listener via impulses), so
-  per-device `alarmStatus` is only a backup. The unlock command → lock was
-  verified end-to-end; the panel `fire-alarm` trigger itself is per Ring's
-  data model but hadn't been observed firing (testing was done in Practice
-  Mode). The service logs every panel `alarmInfo.state` transition, so a
-  real event leaves an audit trail — check it after any alarm.
+  trigger, so this doesn't add a dependency the detection side didn't already
+  have.
+- **Fire trigger is unverified in the field**: the unlock command → lock path
+  was verified end-to-end, but the panel `fire-alarm` trigger itself is per
+  Ring's data model and hadn't been observed firing (testing was done in
+  Practice Mode). Individual smoke/CO detectors were observed *not* to flip
+  their own `alarmStatus` in the data shadow (the Bluejay signals via
+  `pushToTest`/impulses; the listener via impulses), which is why per-device
+  `alarmStatus` is only a backup. Every panel `alarmInfo.state` transition is
+  logged — check the log after any real alarm.
+- **Sunset scheduling uses a single timer**: a large system clock jump or a
+  long suspend can skew the next firing until the following day's reschedule.
 
 ## Troubleshooting
 
-- **No Ring events**: check that port 5228 outbound to `mtalk.google.com`
-  isn't blocked. Also prune stale sessions in the Ring app under
-  Account → Authorized Client Devices.
-- **Dirigera pairing fails**: the action-button press window is short
-  (~60s). Re-run pairing and press the button as soon as the CLI starts
-  polling. If you see `Gateway discovery timed out`, mDNS isn't reaching
-  the hub — find the IP with `sudo nmap -p 8443 --open -T4 <your-subnet>`
-  and use `npx dirigera authenticate --gateway-IP <ip>`.
-- **Sunset doesn't fire**: check the startup log for the computed next
-  sunset time. If it's wrong, your `LATITUDE` / `LONGITUDE` are off, or
-  the system clock is in a surprising timezone.
-- **Blind closes anyway when door is open**: confirm the IKEA Home Smart
-  sunset scene is disabled. Also check the startup log — if the mapping
-  entry didn't resolve to a real sensor, you'll see a `WARN:` line.
+- **No Ring events**: check that port 5228 outbound to `mtalk.google.com` isn't
+  blocked. Also prune stale sessions in the Ring app under Account → Authorized
+  Client Devices.
+- **Dirigera pairing fails**: the action-button press window is short (~60s).
+  Re-run pairing and press the button as soon as the CLI starts polling. If you
+  see `Gateway discovery timed out`, mDNS isn't reaching the hub — find the IP
+  with `sudo nmap -p 8443 --open -T4 <your-subnet>` and use
+  `npx dirigera authenticate --gateway-IP <ip>`.
+- **Sunset doesn't fire**: check the startup log for the computed next sunset.
+  If it's wrong, `LATITUDE` / `LONGITUDE` are off or the system clock is in a
+  surprising timezone.
+- **Blind closes anyway when a door is open**: confirm the IKEA Home Smart
+  sunset scene is disabled. Then check the startup log — an unresolved mapping
+  entry logs a `WARN:` line, and an unmapped blind closes unconditionally by
+  design.
+- **Level-sync never fires**: run `npm run diag` on the Pi. The verdict line
+  names the exact rule that stood it down (burst too small, no consensus, too
+  many stragglers).
+- **Smoke-unlock silent**: `Smoke-unlock: armed` must appear at startup;
+  otherwise one of the four `ST_*` values is missing. A keepalive failure logs
+  `SmartThings token keepalive failed` — re-run `npm run pair-smartthings`.
+- **Service won't start**: it exits deliberately on missing
+  `RING_REFRESH_TOKEN`, no Ring locations, no camera matching `CAMERA_NAME`, no
+  alarm hub, a failed hub connection after 3 attempts, or no contact sensor
+  matching any wanted name. Each logs the reason and the available names.
