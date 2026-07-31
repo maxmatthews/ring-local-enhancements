@@ -113,15 +113,22 @@ ssh "$PI_HOST" "cd '$PI_DIR' && printf '%s\n' '$COMMIT' > .deployed-commit && pm
 
 say "Verifying"
 sleep 5
-STATUS="$(ssh "$PI_HOST" "pm2 jlist" | node -e "
+# pm2 sometimes prefixes jlist with update banners, so slice out the JSON array
+# rather than parsing the whole stream.
+STATUS="$(ssh "$PI_HOST" "pm2 jlist" 2>/dev/null | node -e "
   let raw='';
   process.stdin.on('data', d => raw += d);
   process.stdin.on('end', () => {
-    const app = JSON.parse(raw).find(a => a.name === '$PM2_APP');
-    if (!app) { console.log('missing'); return; }
-    console.log(app.pm2_env.status + ' restarts=' + app.pm2_env.restart_time);
+    try {
+      const json = raw.slice(raw.indexOf('['), raw.lastIndexOf(']') + 1);
+      const app = JSON.parse(json).find(a => a.name === '$PM2_APP');
+      if (!app) return console.log('missing');
+      console.log(app.pm2_env.status + ' restarts=' + app.pm2_env.restart_time);
+    } catch (e) {
+      console.log('unparseable');
+    }
   });
-")"
+" || echo "unknown")"
 echo "  pm2: $STATUS"
 case "$STATUS" in
   online*) ;;
