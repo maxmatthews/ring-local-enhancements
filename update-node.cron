@@ -52,12 +52,18 @@ command -v pm2 >/dev/null 2>&1 || fail \
 
 # Regenerate the startup unit so it names the new Node. Without this the next
 # reboot resurrects from a version that a later upgrade may remove.
+#
+# pm2 startup behaves two ways: if it can sudo it writes the unit itself, and
+# otherwise it prints a "sudo ..." line for you to run. Handle both, and judge
+# success by the unit's contents rather than the pipeline's exit status -- in
+# the self-executing case grep matches nothing and exits 1, which under
+# pipefail looks like a failure when the work actually succeeded.
 pm2 unstartup systemd -u pi --hp /home/pi >/dev/null 2>&1 || true
-pm2 startup systemd -u pi --hp /home/pi 2>/dev/null | grep -E '^sudo' | bash \
-  || fail "pm2 startup could not regenerate $UNIT"
+STARTUP_OUT=$(pm2 startup systemd -u pi --hp /home/pi 2>&1) || true
+printf '%s\n' "$STARTUP_OUT" | grep -E '^sudo ' | bash || true
 
-grep -q "$NEW_VERSION" "$UNIT" 2>/dev/null \
-  || fail "$UNIT does not reference $NEW_VERSION after regeneration"
+grep -q "$NEW_VERSION" "$UNIT" 2>/dev/null || fail \
+  "$UNIT does not reference $NEW_VERSION after regeneration. Last pm2 startup output: $(printf '%s' "$STARTUP_OUT" | tail -3 | tr '\n' ' ')"
 
 pm2 update || fail "pm2 update failed (daemon may still be on $OLD_VERSION)"
 pm2 save   || fail "pm2 save failed"
@@ -78,6 +84,12 @@ STOPPED=$(pm2 jlist 2>/dev/null \
 if [ -n "$STOPPED" ]; then
   log "note: not online after migration: $STOPPED"
 fi
+
+# `nvm install --default` does not reliably move the default alias when the
+# target version is already present, which would leave the next run comparing
+# against a stale "current". Pin it explicitly to what we just migrated to.
+nvm alias default "$NEW_VERSION" >/dev/null 2>&1 \
+  || log "note: could not set the nvm default alias to $NEW_VERSION"
 
 log "PM2 migrated to $NEW_VERSION; unit regenerated; daemon confirmed"
 INNER
