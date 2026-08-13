@@ -203,11 +203,51 @@ nudge). Both the service and the diag call the same function.
 - Subscribes to the Dirigera event stream (`startListeningForUpdates`) to
   notice blind level changes from any source — the IKEA app, a remote, or a
   scene.
-- Hub connection is retried 3 times with a 30s timeout per attempt before the
-  process gives up and exits (pm2 restarts it). Dirigera stream terminations
-  are logged; the client reconnects itself.
+- The hub connection retries indefinitely with exponential backoff, and
+  re-resolves the hub's address on each attempt (see [Hub addressing](#hub-addressing)).
+  Sunset stays scheduled while the hub is unreachable, so a hub that returns
+  before evening still gets its close.
 - `SIGINT` / `SIGTERM` stop the Dirigera listener and exit cleanly; unhandled
   rejections are logged rather than fatal.
+
+## Hub addressing
+
+The Dirigera hub is a DHCP client, so its IP moves — and when it does, nothing
+about the failure is obvious: the REST calls fail, and the event-stream
+WebSocket has the old IP baked into its URL and retries that dead address
+forever without surfacing an error.
+
+So `DIRIGERA_HOST` is treated as a *hint*, not a pin:
+
+1. **Connect** to `DIRIGERA_HOST` if set. The blind list doubles as the
+   reachability probe, since building the client does no I/O.
+2. **Discover** over mDNS (`_ihsp._tcp.local`) if that fails, preferring the
+   hub's IPv4 — the `A` record, or the `ipv4address` field it publishes in TXT.
+   Addresses are only accepted after correlating `PTR → SRV → A`, so records
+   from other services sharing the response packet can't be mistaken for it.
+3. **Persist** the new address back to `.env` (`DIRIGERA_PERSIST_HOST=false`
+   to disable), so the next restart starts from the right place.
+4. **Retry** with backoff from `DIRIGERA_RECONNECT_MIN_MS` up to
+   `DIRIGERA_RECONNECT_MAX_MS`, forever. A hub that's slow to boot or briefly
+   off the network resolves itself without a restart.
+
+A health check every `DIRIGERA_HEALTH_CHECK_MS` catches the silent failures.
+When the event stream is running it watches for silence: the client pings every
+30s and the hub pongs back, so nothing at all for `DIRIGERA_SILENCE_TIMEOUT_MS`
+means the connection is dead rather than the house merely being quiet. With
+level-sync off there's no stream to watch, so it polls the REST API instead —
+otherwise a hub that moved between sunsets would go unnoticed until the
+evening's close silently failed.
+
+**A DHCP reservation is still worth setting** — it removes the most common
+trigger, and discovery then only has to cover the rarer cases (hub reboot,
+router replacement, the Pi booting first). The two are complementary. If you
+have a reservation and would rather a wrong address fail loudly than be
+silently corrected, set `DIRIGERA_DISCOVERY_ENABLED=false`.
+
+Note that mDNS discovery needs the hub on the same L2 segment as the Pi, or
+mDNS reflection enabled across VLANs. If they're separated and you can't
+reflect mDNS, keep `DIRIGERA_HOST` set and rely on the reservation.
 
 ## Prerequisites
 
@@ -355,16 +395,30 @@ over `.env` values, so you can override any of these on the command line.
 | `SNOOZE_MINUTES` | `30` | Snooze duration |
 | `COOLDOWN_SECONDS` | `60` | Min gap between snooze triggers |
 
-**Dirigera blinds** — if any of the four are missing, features 2 and 4 stay off.
+**Dirigera blinds** — features 2 and 4 need `DIRIGERA_TOKEN`, `LATITUDE` and
+`LONGITUDE`. `DIRIGERA_HOST` is optional; see [Hub addressing](#hub-addressing).
 
 | Variable | Default | Description |
 | --- | --- | --- |
-| `DIRIGERA_HOST` | (optional) | Dirigera hub IP |
+| `DIRIGERA_HOST` | (optional) | Starting address for the hub. A hint, not a pin — see below |
 | `DIRIGERA_TOKEN` | (optional) | Access token from `npm run pair-dirigera` |
 | `LATITUDE` | (optional) | Decimal degrees, for sunset calc |
 | `LONGITUDE` | (optional) | Decimal degrees, for sunset calc |
 | `BLIND_SENSOR_MAP_FILE` | `blind-sensor-map.json` | Mapping file path, relative to the project dir |
 | `POST_CLOSE_DELAY_SECONDS` | `60` | Delay between last mapped sensor closing and the blind closing |
+
+**Hub reachability**
+
+| Variable | Default | Description |
+| --- | --- | --- |
+| `DIRIGERA_DISCOVERY_ENABLED` | `true` | Fall back to mDNS when the configured address fails |
+| `DIRIGERA_PERSIST_HOST` | `true` | Write a newly discovered address back to `.env` |
+| `DIRIGERA_DISCOVERY_TIMEOUT_MS` | `10000` | How long to wait for an mDNS answer |
+| `DIRIGERA_PROBE_TIMEOUT_MS` | `10000` | How long a candidate address gets to serve a request |
+| `DIRIGERA_RECONNECT_MIN_MS` | `5000` | First reconnect delay |
+| `DIRIGERA_RECONNECT_MAX_MS` | `300000` | Backoff ceiling; retries continue at this rate forever |
+| `DIRIGERA_HEALTH_CHECK_MS` | `60000` | How often the connection is checked |
+| `DIRIGERA_SILENCE_TIMEOUT_MS` | `150000` | Event-stream silence that counts as a dead connection |
 
 **Level-sync retry**
 
@@ -473,6 +527,7 @@ for more than ~30 days, re-run `npm run pair-smartthings`.
 | File | Role |
 | --- | --- |
 | `index.mjs` | The service: all four automations, config, lifecycle |
+| `hub-discovery.mjs` | mDNS lookup of the Dirigera hub, preferring IPv4 (`discoverDirigeraHost`) |
 | `level-sync.mjs` | Pure decision logic for the level-sync retry (`planLevelSync`) |
 | `test-level-sync.mjs` | Unit tests for the above (`npm test`) |
 | `diag-level-sync.mjs` | Live read-only diagnostic (`npm run diag`) |
@@ -543,5 +598,16 @@ where they're used. Never put real secrets in `.env.example`.
   `SmartThings token keepalive failed` — re-run `npm run pair-smartthings`.
 - **Service won't start**: it exits deliberately on missing
   `RING_REFRESH_TOKEN`, no Ring locations, no camera matching `CAMERA_NAME`, no
-  alarm hub, a failed hub connection after 3 attempts, or no contact sensor
-  matching any wanted name. Each logs the reason and the available names.
+  alarm hub, or no contact sensor matching any wanted name. Each logs the
+  reason and the available names. An unreachable Dirigera hub is *not* fatal —
+  it retries in the background.
+- **Blinds do nothing, but Ring still works**: the hub is unreachable. The log
+  shows `Dirigera connect attempt N failed`. If discovery also fails
+  (`no Dirigera hub answered _ihsp._tcp.local`), the Pi can't see the hub over
+  mDNS — check they're on the same subnet, then find it by hand with
+  `sudo nmap -p 8443 --open -T4 <your-subnet>` and set `DIRIGERA_HOST`.
+- **Hub moved**: nothing to do — the log shows
+  `Hub address changed -- saved DIRIGERA_HOST=<ip> to .env` and carries on.
+  To find it yourself: `dns-sd -B _ihsp._tcp` (macOS) or
+  `avahi-browse -rt _ihsp._tcp` (Linux). A DHCP reservation avoids the whole
+  situation.

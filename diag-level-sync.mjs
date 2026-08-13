@@ -17,6 +17,7 @@
  */
 
 import { createDirigeraClient } from "dirigera";
+import { discoverDirigeraHost } from "./hub-discovery.mjs";
 import { planLevelSync, blindDisplayName } from "./level-sync.mjs";
 import { readFileSync, existsSync } from "fs";
 import { resolve, dirname } from "path";
@@ -52,12 +53,28 @@ const cfg = {
 
 const pad = (s, n) => String(s).padEnd(n);
 
-const client = await createDirigeraClient({
-  accessToken: process.env.DIRIGERA_TOKEN,
-  gatewayIP: process.env.DIRIGERA_HOST,
-});
+// Same hint-then-discover fallback the service uses, so a moved hub doesn't
+// make the diagnostic unusable exactly when you need it to explain a failure.
+async function connect() {
+  const configured = process.env.DIRIGERA_HOST;
+  if (configured) {
+    try {
+      const client = await createDirigeraClient({ accessToken: process.env.DIRIGERA_TOKEN, gatewayIP: configured });
+      return { client, blinds: await client.blinds.list(), ip: configured };
+    } catch (err) {
+      console.error(`Hub did not answer at ${configured} (${err.message}) -- searching over mDNS...`);
+    }
+  }
+  const { ip, hostname, via } = await discoverDirigeraHost({
+    timeoutMs: parseInt(process.env.DIRIGERA_DISCOVERY_TIMEOUT_MS || "10000", 10),
+  });
+  console.error(`Found the hub at ${ip} (${hostname}, via ${via})`);
+  if (configured) console.error(`NOTE: DIRIGERA_HOST in .env still says ${configured}`);
+  const client = await createDirigeraClient({ accessToken: process.env.DIRIGERA_TOKEN, gatewayIP: ip });
+  return { client, blinds: await client.blinds.list(), ip };
+}
 
-const blinds = await client.blinds.list();
+const { client, blinds } = await connect();
 blinds.sort((a, b) => blindDisplayName(a).localeCompare(blindDisplayName(b)));
 
 console.log(`\nDirigera levels: 0 = fully open, 100 = fully closed\n`);

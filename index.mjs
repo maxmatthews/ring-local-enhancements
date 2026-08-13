@@ -16,6 +16,7 @@
 import { RingApi, RingDeviceType } from "ring-client-api";
 import { createDirigeraClient } from "dirigera";
 import { createSmartThingsClient } from "./smartthings-lock.mjs";
+import { discoverDirigeraHost } from "./hub-discovery.mjs";
 import { planLevelSync } from "./level-sync.mjs";
 import SunCalc from "suncalc";
 import { readFileSync, writeFileSync, existsSync } from "fs";
@@ -62,6 +63,21 @@ const LATITUDE = parseFloat(process.env.LATITUDE || "");
 const LONGITUDE = parseFloat(process.env.LONGITUDE || "");
 const BLIND_SENSOR_MAP_FILE = process.env.BLIND_SENSOR_MAP_FILE || "blind-sensor-map.json";
 const POST_CLOSE_DELAY_SECONDS = parseInt(process.env.POST_CLOSE_DELAY_SECONDS || "60", 10);
+
+// --- Hub reachability -------------------------------------------------------
+// DIRIGERA_HOST is a hint, not a fixed address: the hub is a DHCP client and
+// its IP moves. Any connect failure falls back to mDNS discovery, and a
+// connection that goes quiet is torn down and rebuilt.
+const DIRIGERA_DISCOVERY_ENABLED = (process.env.DIRIGERA_DISCOVERY_ENABLED || "true") !== "false";
+const DIRIGERA_PERSIST_HOST = (process.env.DIRIGERA_PERSIST_HOST || "true") !== "false";
+const DIRIGERA_DISCOVERY_TIMEOUT_MS = parseInt(process.env.DIRIGERA_DISCOVERY_TIMEOUT_MS || "10000", 10);
+const DIRIGERA_PROBE_TIMEOUT_MS = parseInt(process.env.DIRIGERA_PROBE_TIMEOUT_MS || "10000", 10);
+const DIRIGERA_RECONNECT_MIN_MS = parseInt(process.env.DIRIGERA_RECONNECT_MIN_MS || "5000", 10);
+const DIRIGERA_RECONNECT_MAX_MS = parseInt(process.env.DIRIGERA_RECONNECT_MAX_MS || "300000", 10);
+const DIRIGERA_HEALTH_CHECK_MS = parseInt(process.env.DIRIGERA_HEALTH_CHECK_MS || "60000", 10);
+// The client pings the hub every 30s and the hub pongs back, so an event
+// stream producing nothing for this long is dead, not merely a quiet house.
+const DIRIGERA_SILENCE_TIMEOUT_MS = parseInt(process.env.DIRIGERA_SILENCE_TIMEOUT_MS || "150000", 10);
 
 // SmartThings smoke-triggered auto-unlock (Ultraloq lock linked into SmartThings).
 const ST_CLIENT_ID = process.env.ST_CLIENT_ID;
@@ -135,7 +151,10 @@ if (!REFRESH_TOKEN) {
   process.exit(1);
 }
 
-const blindsEnabled = !!(DIRIGERA_HOST && DIRIGERA_TOKEN && Number.isFinite(LATITUDE) && Number.isFinite(LONGITUDE));
+// DIRIGERA_HOST is optional now: with discovery on, an empty host just means
+// the first connect starts with an mDNS query instead of a known address.
+const dirigeraAddressable = !!DIRIGERA_HOST || DIRIGERA_DISCOVERY_ENABLED;
+const blindsEnabled = !!(dirigeraAddressable && DIRIGERA_TOKEN && Number.isFinite(LATITUDE) && Number.isFinite(LONGITUDE));
 const smokeUnlockEnabled = !!(ST_CLIENT_ID && ST_CLIENT_SECRET && ST_REFRESH_TOKEN && ST_LOCK_DEVICE_ID);
 
 function log(msg) {
@@ -288,15 +307,156 @@ let dirigera = null;
 // spaces its commands out and runs its own retries, so the two would fight.
 let sunsetSequenceActive = false;
 
-async function connectDirigera() {
-  log(`Connecting to Dirigera hub at ${DIRIGERA_HOST}...`);
-  dirigera = await createDirigeraClient({
-    accessToken: DIRIGERA_TOKEN,
-    gatewayIP: DIRIGERA_HOST,
-  });
-  const blinds = await dirigera.blinds.list();
-  log(`Dirigera connected. ${blinds.length} blind(s): ${blinds.map((b) => b.attributes?.customName || b.id).join(", ")}`);
+// Last address the hub actually answered on. Starts as the configured hint and
+// is replaced whenever discovery finds the hub somewhere else.
+let dirigeraHost = DIRIGERA_HOST || null;
+let levelSyncWatchActive = false;
+let lastDirigeraEventAt = 0;
+let dirigeraReconnecting = false;
+let healthCheckTimer = null;
+
+// Blind work is scheduled on timers, not on connectivity, so it can fire while
+// the hub is unreachable. Fail with a legible message rather than a TypeError.
+function hub() {
+  if (!dirigera) throw new Error("not connected to the Dirigera hub");
+  return dirigera;
+}
+
+// Runs `promise` against a deadline. The loser keeps running: got has no
+// default timeout and createDirigeraClient exposes no way to set one, so a
+// probe against a vacant IP would otherwise hang for the OS connect timeout
+// (minutes) instead of failing over to discovery.
+function withTimeout(promise, ms, label) {
+  promise.catch(() => {}); // the abandoned side must not surface as unhandled
+  let timer;
+  return Promise.race([
+    promise,
+    new Promise((_, reject) => {
+      timer = setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms);
+    }),
+  ]).finally(() => clearTimeout(timer));
+}
+
+// createDirigeraClient does no I/O -- it only builds an HTTP client -- so the
+// blind list doubles as the reachability probe for a candidate address.
+async function probeHost(ip) {
+  const client = await createDirigeraClient({ accessToken: DIRIGERA_TOKEN, gatewayIP: ip });
+  const blinds = await withTimeout(client.blinds.list(), DIRIGERA_PROBE_TIMEOUT_MS, `Dirigera probe at ${ip}`);
+  return { client, blinds };
+}
+
+async function discoverHost() {
+  if (!DIRIGERA_DISCOVERY_ENABLED) throw new Error("mDNS discovery is disabled (DIRIGERA_DISCOVERY_ENABLED=false)");
+  log("Searching for the Dirigera hub over mDNS...");
+  const { ip, hostname, via } = await discoverDirigeraHost({ timeoutMs: DIRIGERA_DISCOVERY_TIMEOUT_MS });
+  log(`mDNS found the hub at ${ip} (${hostname}, via ${via})`);
+  return ip;
+}
+
+function adoptConnection(ip, client, blinds) {
+  const moved = dirigeraHost && ip !== dirigeraHost;
+  dirigera = client;
+  dirigeraHost = ip;
+  if (moved && DIRIGERA_PERSIST_HOST) {
+    try {
+      persistEnvVar("DIRIGERA_HOST", ip);
+      log(`Hub address changed -- saved DIRIGERA_HOST=${ip} to .env`);
+    } catch (err) {
+      logError("Could not persist the new DIRIGERA_HOST to .env", err);
+    }
+  }
+  log(
+    `Dirigera connected at ${ip}. ${blinds.length} blind(s): ` +
+      blinds.map((b) => b.attributes?.customName || b.id).join(", ")
+  );
   return blinds;
+}
+
+// Try the last known address, then fall back to discovery.
+async function connectDirigera() {
+  if (dirigeraHost) {
+    log(`Connecting to Dirigera hub at ${dirigeraHost}...`);
+    try {
+      const { client, blinds } = await probeHost(dirigeraHost);
+      return adoptConnection(dirigeraHost, client, blinds);
+    } catch (err) {
+      logError(`Hub did not answer at ${dirigeraHost} -- falling back to discovery`, err);
+    }
+  }
+  const ip = await discoverHost();
+  const { client, blinds } = await probeHost(ip);
+  return adoptConnection(ip, client, blinds);
+}
+
+// Retries until it connects. A hub that is slow to boot, briefly off the
+// network, or newly re-addressed is a transient condition; the previous
+// behavior turned it into a permanent one, because the process stayed healthy
+// with blinds disabled and pm2 saw no failure to restart.
+async function establishDirigera() {
+  let delay = DIRIGERA_RECONNECT_MIN_MS;
+  for (let attempt = 1; ; attempt++) {
+    try {
+      await connectDirigera();
+      if (LEVEL_SYNC_ENABLED) startLevelSyncWatch();
+      else if (attempt === 1) log("Level-sync retry disabled (BLIND_LEVEL_SYNC_ENABLED=false)");
+      return;
+    } catch (err) {
+      logError(`Dirigera connect attempt ${attempt} failed -- retrying in ${Math.round(delay / 1000)}s`, err);
+      // A rejected token looks identical to an unreachable hub from here, and
+      // retrying will never fix it. Say so once rather than leaving the same
+      // error repeating in the log with no explanation.
+      if (attempt === 1 && /token|unauthor|forbidden|401|403/i.test(err?.message || "")) {
+        log("  ^ that reads like an auth failure, not a network one -- re-pair with `npm run pair-dirigera`");
+      }
+      await sleep(delay);
+      delay = Math.min(delay * 2, DIRIGERA_RECONNECT_MAX_MS);
+    }
+  }
+}
+
+async function reconnectDirigera(reason) {
+  if (dirigeraReconnecting) return;
+  dirigeraReconnecting = true;
+  log(`Reconnecting to the Dirigera hub (${reason})`);
+  try {
+    dirigera?.stopListeningForUpdates();
+  } catch (_) {}
+  levelSyncWatchActive = false;
+  dirigera = null;
+  try {
+    await establishDirigera();
+  } finally {
+    dirigeraReconnecting = false;
+  }
+}
+
+// Catches the failure the reconnecting WebSocket cannot: its URL has the old
+// IP baked in, and it retries that dead address forever without ever
+// surfacing an error.
+async function dirigeraHealthCheck() {
+  if (!dirigera || dirigeraReconnecting) return;
+
+  if (levelSyncWatchActive) {
+    const silentMs = Date.now() - lastDirigeraEventAt;
+    if (silentMs < DIRIGERA_SILENCE_TIMEOUT_MS) return;
+    await reconnectDirigera(`no events for ${Math.round(silentMs / 1000)}s`);
+    return;
+  }
+
+  // With no event stream to watch, poll instead -- otherwise a hub that moved
+  // between sunsets goes unnoticed until the evening's close silently fails.
+  try {
+    await withTimeout(hub().blinds.list(), DIRIGERA_PROBE_TIMEOUT_MS, "Dirigera health check");
+  } catch (err) {
+    await reconnectDirigera(`health check failed: ${err.message}`);
+  }
+}
+
+function startDirigeraHealthChecks() {
+  healthCheckTimer = setInterval(() => {
+    dirigeraHealthCheck().catch((err) => logError("Dirigera health check failed", err));
+  }, DIRIGERA_HEALTH_CHECK_MS);
+  healthCheckTimer.unref?.();
 }
 
 // blindId -> timestamp until which target changes are assumed to be echoes of
@@ -320,7 +480,7 @@ function isSelfCommanded(blindId) {
 async function setBlindLevel(blindId, blindName, level) {
   markSelfCommanded(blindId);
   try {
-    await dirigera.blinds.setTargetLevel({ id: blindId, blindsTargetLevel: level });
+    await hub().blinds.setTargetLevel({ id: blindId, blindsTargetLevel: level });
     return true;
   } catch (err) {
     logError(`Failed to set blind "${blindName}" to level ${level}`, err);
@@ -356,7 +516,7 @@ async function retryStillOpen(targets, pass) {
 
   let current;
   try {
-    current = await dirigera.blinds.list();
+    current = await hub().blinds.list();
   } catch (err) {
     logError(`Retry ${pass}: failed to list blinds, skipping pass`, err);
     return retryStillOpen(targets, pass + 1);
@@ -394,7 +554,7 @@ async function onSunset(sensors) {
 
   let blinds;
   try {
-    blinds = await dirigera.blinds.list();
+    blinds = await hub().blinds.list();
   } catch (err) {
     logError("Failed to list blinds from Dirigera", err);
     return;
@@ -563,7 +723,7 @@ async function syncStragglers(target, stragglers, burst, commanded, generation) 
 
     let current;
     try {
-      current = await dirigera.blinds.list();
+      current = await hub().blinds.list();
     } catch (err) {
       logError(`Level sync attempt ${pass}: failed to list blinds, retrying same set`, err);
       continue;
@@ -628,7 +788,7 @@ async function evaluateBurst() {
 
   let blinds;
   try {
-    blinds = await dirigera.blinds.list();
+    blinds = await hub().blinds.list();
   } catch (err) {
     logError("Level sync: failed to list blinds", err);
     return;
@@ -697,7 +857,12 @@ function onDirigeraEvent(event) {
 }
 
 function startLevelSyncWatch() {
-  dirigera.startListeningForUpdates((event) => {
+  lastDirigeraEventAt = Date.now();
+  levelSyncWatchActive = true;
+  hub().startListeningForUpdates((event) => {
+    // Every frame counts as liveness, including the hub's pong replies -- a
+    // house can legitimately go hours without a device event.
+    lastDirigeraEventAt = Date.now();
     try {
       onDirigeraEvent(event);
     } catch (err) {
@@ -974,10 +1139,13 @@ async function main() {
   log("Ring local enhancements (camera snooze + Dirigera sunset gate)");
   log(`  Snooze sensor: "${SENSOR_NAME}" -> camera: "${CAMERA_NAME}" (${SNOOZE_MINUTES}min, ${COOLDOWN_SECONDS}s cooldown)`);
   if (blindsEnabled) {
-    log(`  Dirigera: ${DIRIGERA_HOST} | lat,lon: ${LATITUDE},${LONGITUDE} | post-close delay: ${POST_CLOSE_DELAY_SECONDS}s`);
+    log(`  Dirigera: ${DIRIGERA_HOST || "(no host set -- will discover)"} | lat,lon: ${LATITUDE},${LONGITUDE} | post-close delay: ${POST_CLOSE_DELAY_SECONDS}s`);
+    log(
+      `  Hub discovery: ${DIRIGERA_DISCOVERY_ENABLED ? "on" : "off"} | health check every ${DIRIGERA_HEALTH_CHECK_MS / 1000}s`
+    );
     log(`  Blind mapping: ${Object.keys(blindMap).length ? JSON.stringify(blindMap) : "(none)"}`);
   } else {
-    log("  Dirigera disabled (missing DIRIGERA_HOST / DIRIGERA_TOKEN / LATITUDE / LONGITUDE)");
+    log("  Dirigera disabled (missing DIRIGERA_TOKEN / LATITUDE / LONGITUDE, or no host and discovery off)");
   }
   if (smokeUnlockEnabled) {
     log(`  Smoke-unlock: armed -> SmartThings lock ${ST_LOCK_DEVICE_ID} (cooldown ${SMOKE_UNLOCK_COOLDOWN_SECONDS}s)`);
@@ -1108,14 +1276,13 @@ async function main() {
   }
 
   if (blindsEnabled) {
-    try {
-      await connectDirigera();
-      scheduleSunset(sensors);
-      if (LEVEL_SYNC_ENABLED) startLevelSyncWatch();
-      else log("Level-sync retry disabled (BLIND_LEVEL_SYNC_ENABLED=false)");
-    } catch (err) {
-      logError("Dirigera setup failed -- blind automation disabled this run", err);
-    }
+    // Sunset runs off a timer, so schedule it regardless of whether the hub is
+    // reachable right now -- by evening the retry loop will have connected.
+    scheduleSunset(sensors);
+    startDirigeraHealthChecks();
+    // Deliberately not awaited: establishDirigera only returns once it has
+    // connected, and an unreachable hub must not hold up the Ring automation.
+    establishDirigera().catch((err) => logError("Dirigera connection loop stopped", err));
   }
 
   log("Automation active.");
@@ -1127,6 +1294,7 @@ async function main() {
 
 function shutdown(signal) {
   log(`Shutting down (${signal})...`);
+  if (healthCheckTimer) clearInterval(healthCheckTimer);
   try { dirigera?.stopListeningForUpdates(); } catch (_) {}
   process.exit(0);
 }
