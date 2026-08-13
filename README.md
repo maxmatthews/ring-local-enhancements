@@ -536,6 +536,7 @@ for more than ~30 days, re-run `npm run pair-smartthings`.
 | `deploy.sh` | rsync + test + pm2 restart deploy to the Pi |
 | `ecosystem.config.cjs` | pm2 app definition |
 | `journal-cleaner.{service,timer}` | systemd journal vacuum, 14-day retention |
+| `update-node.cron` | Reference copy of `/etc/cron.weekly/update-node` on the Pi — weekly Node upgrade + pm2 migration |
 | `.env.example`, `blind-sensor-map.json.example` | Tracked templates |
 
 `.env`, `.env.pi.bak` and `blind-sensor-map.json` are gitignored and exist only
@@ -596,6 +597,20 @@ where they're used. Never put real secrets in `.env.example`.
 - **Smoke-unlock silent**: `Smoke-unlock: armed` must appear at startup;
   otherwise one of the four `ST_*` values is missing. A keepalive failure logs
   `SmartThings token keepalive failed` — re-run `npm run pair-smartthings`.
+- **Node upgrades on the Pi**: `/etc/cron.weekly/update-node` installs the
+  latest v24 and migrates pm2 onto it — carrying global packages across,
+  regenerating the systemd unit, and restarting the daemon. It logs every run:
+
+  ```bash
+  ssh pi@pi.local 'journalctl -t update-node -n 20'
+  ```
+
+  If it fails it says so at error priority and leaves the old, working unit in
+  place rather than tearing down a good boot path. The usual cause is
+  root-owned files under `~/.nvm` or `~/.npm` (they must be `pi:pi`), which
+  stops nvm carrying pm2 into the new version; the error message names the
+  fix. `ecosystem.config.cjs` sets `interpreter: "node"` deliberately, so the
+  app is never pinned to a Node version that a later upgrade removes.
 - **Service won't start**: it exits deliberately on missing
   `RING_REFRESH_TOKEN`, no Ring locations, no camera matching `CAMERA_NAME`, no
   alarm hub, or no contact sensor matching any wanted name. Each logs the

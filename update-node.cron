@@ -1,0 +1,83 @@
+#!/bin/bash
+# Auto-update Node.js to latest v24.x and migrate PM2 onto it if it changed.
+#
+# Runs as the pi user (via sudo -u pi -i) so nvm/pm2 state under /home/pi stays
+# pi-owned -- root-owned files here crash the pi-owned pm2 daemon.
+#
+# Everything is logged to the journal under the tag "update-node":
+#   journalctl -t update-node
+# There is no MTA on this box, so cron's own output goes nowhere. That is how
+# this failed unnoticed for weeks: pm2 was not carried into the new Node, so
+# every pm2 command after the upgrade was "command not found", the systemd unit
+# kept pointing at the old version, and the log still said "restarting PM2".
+# Every step below is now checked, and anything unexpected is a loud failure.
+
+set -uo pipefail
+
+sudo -u pi -i bash <<'INNER'
+set -uo pipefail
+export NVM_DIR="/home/pi/.nvm"
+
+UNIT=/etc/systemd/system/pm2-pi.service
+
+# Absolute path on purpose: nvm rewrites PATH, and a reporting helper that
+# depends on PATH is the one thing that must not be able to go quiet.
+LOGGER=/usr/bin/logger
+log()  { "$LOGGER" -t update-node "$*"; }
+fail() { "$LOGGER" -t update-node -p user.err "FAILED: $*"; exit 1; }
+
+[ -s "$NVM_DIR/nvm.sh" ] || fail "nvm.sh not found under $NVM_DIR"
+# shellcheck disable=SC1090
+. "$NVM_DIR/nvm.sh"
+
+OLD_VERSION=$(node -v 2>/dev/null) || fail "could not read the current node version"
+
+nvm install 24 --default --reinstall-packages-from=current \
+  || fail "nvm install 24 failed"
+
+NEW_VERSION=$(node -v 2>/dev/null) || fail "could not read the new node version"
+
+if [ "$OLD_VERSION" = "$NEW_VERSION" ]; then
+  log "Node.js v24 already up to date: $OLD_VERSION"
+  exit 0
+fi
+
+log "Node.js updated: $OLD_VERSION -> $NEW_VERSION, migrating PM2"
+
+# The upgrade is only safe if pm2 actually came across with the global
+# packages. If it did not, stop while the old unit is still valid rather than
+# tearing down a working boot path.
+command -v pm2 >/dev/null 2>&1 || fail \
+  "pm2 is missing from $NEW_VERSION -- global packages were not carried over. Unit still points at $OLD_VERSION; apps keep running. Check ownership under ~/.nvm and ~/.npm (must be pi:pi), then run: nvm reinstall-packages $OLD_VERSION"
+
+# Regenerate the startup unit so it names the new Node. Without this the next
+# reboot resurrects from a version that a later upgrade may remove.
+pm2 unstartup systemd -u pi --hp /home/pi >/dev/null 2>&1 || true
+pm2 startup systemd -u pi --hp /home/pi 2>/dev/null | grep -E '^sudo' | bash \
+  || fail "pm2 startup could not regenerate $UNIT"
+
+grep -q "$NEW_VERSION" "$UNIT" 2>/dev/null \
+  || fail "$UNIT does not reference $NEW_VERSION after regeneration"
+
+pm2 update || fail "pm2 update failed (daemon may still be on $OLD_VERSION)"
+pm2 save   || fail "pm2 save failed"
+
+# Confirm the daemon really is running under the new Node.
+DAEMON_PID=$(pgrep -f "PM2 v.*God Daemon" | head -1)
+if [ -n "$DAEMON_PID" ]; then
+  DAEMON_NODE=$(readlink -f "/proc/$DAEMON_PID/exe" 2>/dev/null)
+  case "$DAEMON_NODE" in
+    *"$NEW_VERSION"*) : ;;
+    *) fail "pm2 daemon is running $DAEMON_NODE, expected $NEW_VERSION" ;;
+  esac
+fi
+
+# Anything not online that pm2 believes should be is worth shouting about.
+STOPPED=$(pm2 jlist 2>/dev/null \
+  | node -e 'let r="";process.stdin.on("data",d=>r+=d).on("end",()=>{try{const a=JSON.parse(r.slice(r.indexOf("["),r.lastIndexOf("]")+1));console.log(a.filter(x=>x.pm2_env.status!=="online").map(x=>x.name+"("+x.pm2_env.status+")").join(" "));}catch(e){console.log("");}})')
+if [ -n "$STOPPED" ]; then
+  log "note: not online after migration: $STOPPED"
+fi
+
+log "PM2 migrated to $NEW_VERSION; unit regenerated; daemon confirmed"
+INNER
