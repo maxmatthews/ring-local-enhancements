@@ -105,16 +105,34 @@ echo "  currently deployed: $PREVIOUS"
 # swallowed so half the script ran locally. No single quotes may appear below.
 PM2_RESOLVER='
 set -eu
-unit_exec=$(systemctl cat pm2-pi.service 2>/dev/null | sed -n "s|^ExecStart=||p" | head -1 | cut -d" " -f1)
 bin_dir=""
-case "$unit_exec" in
-  */lib/node_modules/pm2/bin/pm2) bin_dir="${unit_exec%/lib/node_modules/pm2/bin/pm2}/bin" ;;
-esac
+
+# 1. The systemd unit names the pm2 that actually runs the service. For the
+#    nvm layout, back out to the Node bin directory so node and pm2 both come
+#    from the same install; otherwise take the directory it sits in.
+unit_exec=$(systemctl cat pm2-pi.service 2>/dev/null | sed -n "s|^ExecStart=||p" | head -1 | cut -d" " -f1)
+if [ -n "$unit_exec" ] && [ -x "$unit_exec" ]; then
+  case "$unit_exec" in
+    */lib/node_modules/pm2/bin/pm2) bin_dir="${unit_exec%/lib/node_modules/pm2/bin/pm2}/bin" ;;
+    *) bin_dir=$(dirname "$unit_exec") ;;
+  esac
+fi
+
+# 2. A pm2 already on PATH -- covers a system-wide install outside nvm.
+if [ -z "$bin_dir" ] || [ ! -x "$bin_dir/pm2" ]; then
+  on_path=$(command -v pm2 2>/dev/null || true)
+  if [ -n "$on_path" ]; then bin_dir=$(dirname "$on_path"); fi
+fi
+
+# 3. Newest nvm Node that still carries a pm2 binary. Deliberately not nvm
+#    default: default tracks the newest Node, which is routinely one pm2 was
+#    never installed into.
 if [ -z "$bin_dir" ] || [ ! -x "$bin_dir/pm2" ]; then
   bin_dir=$(for d in "$HOME"/.nvm/versions/node/*/bin; do
     if [ -x "$d/pm2" ]; then echo "$d"; fi
   done | sort -V | tail -1)
 fi
+
 if [ -z "$bin_dir" ] || [ ! -x "$bin_dir/pm2" ]; then exit 1; fi
 echo "$bin_dir"
 '
