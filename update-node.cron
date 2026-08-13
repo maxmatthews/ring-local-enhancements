@@ -58,7 +58,10 @@ command -v pm2 >/dev/null 2>&1 || fail \
 # success by the unit's contents rather than the pipeline's exit status -- in
 # the self-executing case grep matches nothing and exits 1, which under
 # pipefail looks like a failure when the work actually succeeded.
-pm2 unstartup systemd -u pi --hp /home/pi >/dev/null 2>&1 || true
+# Deliberately no `pm2 unstartup` first: it deletes the unit, and if the
+# regeneration below then failed there would be no unit at all -- apps would
+# keep running but the next reboot would bring up nothing. pm2 startup
+# overwrites the existing unit by itself, so there is no window to lose.
 STARTUP_OUT=$(pm2 startup systemd -u pi --hp /home/pi 2>&1) || true
 printf '%s\n' "$STARTUP_OUT" | grep -E '^sudo ' | bash || true
 
