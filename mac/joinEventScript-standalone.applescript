@@ -17,16 +17,22 @@ property plugToken : "PASTE_YOUR_MEETING_PLUG_TOKEN_HERE"
 
 -- MeetingBar v5+ hands the join hook the full event, so the plug switches off
 -- when the meeting was actually scheduled to end. On 4.11.6 and earlier the
--- script is run with no parameters at all, so the `run` handler below fires
--- instead and the Pi falls back to its default meeting length.
+-- script is run with no parameters at all, which lands in the implicit run
+-- handler further down, and the Pi falls back to its default meeting length.
 on meetingStart(eventID, eventTitle, isAllDay, startDate, endDate, eventLocation, isRecurrent, attendeeCount, meetingURL, meetingService, eventNotes, calendarName, calendarSource, attendeeList)
 	if isAllDay then return
 	notifyPlug(eventTitle, ((endDate - (current date)) div 60))
 end meetingStart
 
-on run
-	notifyPlug("meeting", 0)
-end run
+-- MeetingBar 4.11.6 and earlier run the script with no parameters at all, which
+-- lands here, in the implicit run handler.
+--
+-- Deliberately a bare top-level line rather than an `on run` handler: pasting
+-- into MeetingBar's editor without clearing it first leaves the old script's
+-- top-level commands above this, and AppleScript refuses to compile top-level
+-- commands alongside an explicit `on run` ("The run handler is specified more
+-- than once", -2752). This form simply runs after whatever was left behind.
+notifyPlug("meeting", 0)
 
 -- minutesLeft of 0 or less means "length unknown": the duration is left out and
 -- the Pi uses MEETING_PLUG_DEFAULT_MINUTES.
