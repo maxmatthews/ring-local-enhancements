@@ -6,7 +6,7 @@
   "main": "index.mjs",
   "scripts": {
     "start": "node index.mjs",
-    "test": "node test-level-sync.mjs",
+    "test": "node test-level-sync.mjs && node test-meeting-plug.mjs",
     "diag": "node diag-level-sync.mjs",
     "deploy": "./deploy.sh",
     "auth": "npx -p ring-client-api ring-auth-cli",

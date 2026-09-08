@@ -2,3 +2,4 @@
 .env.pi.bak
 node_modules/*
 blind-sensor-map.json
+.meeting-plug-state.json

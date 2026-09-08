@@ -16,10 +16,13 @@
 import { RingApi, RingDeviceType } from "ring-client-api";
 import { createDirigeraClient } from "dirigera";
 import { createSmartThingsClient } from "./smartthings-lock.mjs";
+import { planMeetingStart, planTick } from "./meeting-plug.mjs";
 import { discoverDirigeraHost } from "./hub-discovery.mjs";
 import { planLevelSync } from "./level-sync.mjs";
 import SunCalc from "suncalc";
-import { readFileSync, writeFileSync, existsSync } from "fs";
+import { createServer } from "http";
+import { timingSafeEqual } from "crypto";
+import { readFileSync, writeFileSync, existsSync, unlinkSync } from "fs";
 import { resolve, dirname } from "path";
 import { fileURLToPath } from "url";
 
@@ -84,6 +87,33 @@ const ST_CLIENT_ID = process.env.ST_CLIENT_ID;
 const ST_CLIENT_SECRET = process.env.ST_CLIENT_SECRET;
 const ST_REFRESH_TOKEN = process.env.ST_REFRESH_TOKEN;
 const ST_LOCK_DEVICE_ID = process.env.ST_LOCK_DEVICE_ID;
+
+// Meeting-triggered smart plug (Zigbee plug paired to the SmartThings hub).
+// A Mac running MeetingBar posts here when a meeting is joined.
+// Name the plug as it appears in the SmartThings app (e.g. "Logo Light"); the
+// device id is looked up at startup. An explicit id wins if you set one.
+const MEETING_PLUG_DEVICE_NAME = process.env.MEETING_PLUG_DEVICE_NAME;
+const MEETING_PLUG_DEVICE_ID = process.env.MEETING_PLUG_DEVICE_ID;
+// One token per Mac, comma separated, so a machine can be revoked on its own
+// (e.g. handing a work laptop back) without re-keying the others.
+const MEETING_PLUG_TOKENS = (process.env.MEETING_PLUG_TOKEN || "")
+  .split(",")
+  .map((t) => t.trim())
+  .filter(Boolean);
+const MEETING_PLUG_PORT = parseInt(process.env.MEETING_PLUG_PORT || "8787", 10);
+const MEETING_PLUG_HOST = process.env.MEETING_PLUG_HOST || "0.0.0.0";
+// Used when MeetingBar gives us no usable end date.
+const MEETING_PLUG_DEFAULT_MINUTES = parseInt(process.env.MEETING_PLUG_DEFAULT_MINUTES || "60", 10);
+// Floor and ceiling on the computed run time. The ceiling is the important one:
+// it stops one bad end date (an all-day event, a mis-parsed date) leaving the
+// plug on indefinitely.
+const MEETING_PLUG_MIN_MINUTES = parseInt(process.env.MEETING_PLUG_MIN_MINUTES || "5", 10);
+const MEETING_PLUG_MAX_MINUTES = parseInt(process.env.MEETING_PLUG_MAX_MINUTES || "240", 10);
+// When the plug is already on as a meeting starts, leave it on afterwards --
+// we didn't switch it on, so it isn't ours to switch off.
+const MEETING_PLUG_RESPECT_EXISTING =
+  (process.env.MEETING_PLUG_RESPECT_EXISTING || "true").toLowerCase() !== "false";
+const MEETING_PLUG_TICK_MS = parseInt(process.env.MEETING_PLUG_TICK_MS || "20000", 10);
 const SMOKE_UNLOCK_COOLDOWN_SECONDS = parseInt(process.env.SMOKE_UNLOCK_COOLDOWN_SECONDS || "300", 10);
 const BLIND_CLOSED_LEVEL = 100;
 const BLIND_CLOSE_SPACING_MS = 10 * 1000;
@@ -156,6 +186,14 @@ if (!REFRESH_TOKEN) {
 const dirigeraAddressable = !!DIRIGERA_HOST || DIRIGERA_DISCOVERY_ENABLED;
 const blindsEnabled = !!(dirigeraAddressable && DIRIGERA_TOKEN && Number.isFinite(LATITUDE) && Number.isFinite(LONGITUDE));
 const smokeUnlockEnabled = !!(ST_CLIENT_ID && ST_CLIENT_SECRET && ST_REFRESH_TOKEN && ST_LOCK_DEVICE_ID);
+// The listener comes up without a device id on purpose: GET /meeting/devices is
+// how you find the plug's id in the first place. Without a token it stays down
+// -- an unauthenticated switch on the LAN is not a reasonable default.
+const meetingPlugServerEnabled = !!(ST_CLIENT_ID && ST_CLIENT_SECRET && ST_REFRESH_TOKEN && MEETING_PLUG_TOKENS.length);
+const meetingPlugConfigured = !!(meetingPlugServerEnabled && (MEETING_PLUG_DEVICE_ID || MEETING_PLUG_DEVICE_NAME));
+// One SmartThings client serves both features. Two would fight: refresh tokens
+// rotate on every use, so a second client would invalidate the first one's.
+const smartThingsEnabled = smokeUnlockEnabled || meetingPlugServerEnabled;
 
 function log(msg) {
   console.log(`[${new Date().toISOString()}] ${msg}`);
@@ -1132,6 +1170,361 @@ function setupPanelAlarmWatch(devices, stClient) {
 }
 
 // ---------------------------------------------------------------------------
+// Meeting-triggered smart plug
+// ---------------------------------------------------------------------------
+// A Mac running MeetingBar posts here when a meeting is joined; the plug goes
+// on now and is scheduled off at the meeting's scheduled end.
+//
+// Two things are deliberate about where this lives:
+//
+//   1. The schedule is held here, not on the Mac. The laptop is usually shut
+//      the moment a meeting ends, and a sleeping laptop switches nothing off.
+//      The Pi is always up, so the off happens on time regardless.
+//   2. It runs inside this process rather than a helper script, because
+//      SmartThings rotates the refresh token on every use. A second client
+//      would silently invalidate the token the smoke-unlock path depends on.
+
+const MEETING_PLUG_STATE_FILE = resolve(__dirname, ".meeting-plug-state.json");
+const MEETING_PLUG_CFG = {
+  defaultMinutes: MEETING_PLUG_DEFAULT_MINUTES,
+  minMinutes: MEETING_PLUG_MIN_MINUTES,
+  maxMinutes: MEETING_PLUG_MAX_MINUTES,
+  respectExisting: MEETING_PLUG_RESPECT_EXISTING,
+};
+const MEETING_PLUG_MAX_ATTEMPTS = 3;
+const MEETING_PLUG_RETRY_DELAY_MS = 5000;
+const MEETING_PLUG_MAX_BODY_BYTES = 8 * 1024;
+
+// Resolved from MEETING_PLUG_DEVICE_NAME at startup, or set outright by
+// MEETING_PLUG_DEVICE_ID. Null until it resolves.
+let meetingPlugDeviceId = MEETING_PLUG_DEVICE_ID || null;
+
+// { offAt: epoch ms, owned: bool, title: string } while a meeting is running.
+let meetingSession = null;
+let meetingStClient = null;
+let meetingServer = null;
+let meetingTickTimer = null;
+let meetingTickBusy = false;
+
+// The session outlives the process: a deploy or a pm2 restart mid-meeting must
+// not strand the plug on. On restart we reload it and, if the off time already
+// passed while we were down, switch off on the first tick.
+function saveMeetingSession() {
+  try {
+    if (meetingSession) writeFileSync(MEETING_PLUG_STATE_FILE, JSON.stringify(meetingSession));
+    else if (existsSync(MEETING_PLUG_STATE_FILE)) unlinkSync(MEETING_PLUG_STATE_FILE);
+  } catch (err) {
+    logError("Could not persist the meeting-plug session", err);
+  }
+}
+
+function loadMeetingSession() {
+  if (!existsSync(MEETING_PLUG_STATE_FILE)) return null;
+  try {
+    const raw = JSON.parse(readFileSync(MEETING_PLUG_STATE_FILE, "utf-8"));
+    if (!Number.isFinite(raw?.offAt)) return null;
+    return { offAt: raw.offAt, owned: raw.owned !== false, title: raw.title || "" };
+  } catch (err) {
+    logError("Ignoring unreadable meeting-plug state file", err);
+    return null;
+  }
+}
+
+async function setMeetingPlug(on) {
+  for (let attempt = 1; attempt <= MEETING_PLUG_MAX_ATTEMPTS; attempt++) {
+    try {
+      await meetingStClient.setSwitch(meetingPlugDeviceId, on);
+      return true;
+    } catch (err) {
+      logError(`Meeting plug ${on ? "on" : "off"} attempt ${attempt}/${MEETING_PLUG_MAX_ATTEMPTS} failed`, err);
+      if (attempt < MEETING_PLUG_MAX_ATTEMPTS) await sleep(MEETING_PLUG_RETRY_DELAY_MS);
+    }
+  }
+  return false;
+}
+
+// Runs on a short interval against an absolute timestamp rather than as one
+// long setTimeout, so a restored session and a clock jump both behave.
+async function meetingTick() {
+  if (meetingTickBusy) return;
+  const plan = planTick({ now: Date.now(), session: meetingSession });
+  if (plan.action === "idle" || plan.action === "wait") return;
+
+  if (plan.action === "release") {
+    log(`Meeting over ("${meetingSession.title}") -- plug was already on beforehand, leaving it on.`);
+    meetingSession = null;
+    saveMeetingSession();
+    return;
+  }
+
+  meetingTickBusy = true;
+  try {
+    const title = meetingSession.title;
+    // A session restored from disk can outlive knowledge of which plug it was:
+    // resolve again rather than firing commands at a null device id forever.
+    if (!(await resolveMeetingPlugDevice())) {
+      logError("Meeting is over but no plug is resolved -- cannot switch off");
+      return;
+    }
+    if (await setMeetingPlug(false)) {
+      log(`Meeting over ("${title}") -- plug switched off.`);
+      meetingSession = null;
+      saveMeetingSession();
+    } else {
+      // Session deliberately left in place so the next tick tries again.
+      logError("Could not switch the meeting plug off -- retrying on the next tick");
+    }
+  } finally {
+    meetingTickBusy = false;
+  }
+}
+
+function isSwitchDevice(device) {
+  return (device.components || []).some((c) => (c.capabilities || []).some((cap) => cap.id === "switch"));
+}
+
+const meetingDeviceLabel = (device) => device.label || device.name || device.deviceId;
+
+/**
+ * Turn MEETING_PLUG_DEVICE_NAME into a device id.
+ *
+ * Named rather than id-configured by default because every other device in this
+ * project is matched by name too, and a SmartThings device id is a uuid nobody
+ * can eyeball. An exact label match wins over a substring one so that a plug
+ * called "Logo Light" isn't beaten by "Logo Light Strip".
+ */
+async function resolveMeetingPlugDevice() {
+  if (meetingPlugDeviceId) return meetingPlugDeviceId;
+  if (!MEETING_PLUG_DEVICE_NAME) return null;
+
+  const switches = (await meetingStClient.listDevices()).filter(isSwitchDevice);
+  const wanted = MEETING_PLUG_DEVICE_NAME.trim().toLowerCase();
+  const exact = switches.filter((d) => meetingDeviceLabel(d).trim().toLowerCase() === wanted);
+  const matches = exact.length ? exact : switches.filter((d) => nameMatches(meetingDeviceLabel(d), wanted));
+
+  if (matches.length === 0) {
+    logError(
+      `No SmartThings switch matches MEETING_PLUG_DEVICE_NAME "${MEETING_PLUG_DEVICE_NAME}". ` +
+        `Available: ${switches.map(meetingDeviceLabel).join(", ") || "(none)"}`
+    );
+    return null;
+  }
+  if (matches.length > 1) {
+    log(`WARN: ${matches.length} switches match "${MEETING_PLUG_DEVICE_NAME}" (${matches.map(meetingDeviceLabel).join(", ")}) -- using the first.`);
+  }
+
+  meetingPlugDeviceId = matches[0].deviceId;
+  log(`  Meeting plug: "${meetingDeviceLabel(matches[0])}" -> ${meetingPlugDeviceId}`);
+  return meetingPlugDeviceId;
+}
+
+function meetingAuthOk(req) {
+  const header = req.headers.authorization || "";
+  const presented = header.startsWith("Bearer ") ? header.slice(7) : "";
+  if (!presented) return false;
+  const a = Buffer.from(presented);
+  return MEETING_PLUG_TOKENS.some((token) => {
+    const b = Buffer.from(token);
+    return a.length === b.length && timingSafeEqual(a, b);
+  });
+}
+
+function sendJson(res, status, body) {
+  const payload = JSON.stringify(body);
+  res.writeHead(status, { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(payload) });
+  res.end(payload);
+}
+
+function readJsonBody(req) {
+  return new Promise((resolvePromise, reject) => {
+    let size = 0;
+    const chunks = [];
+    req.on("data", (chunk) => {
+      size += chunk.length;
+      if (size > MEETING_PLUG_MAX_BODY_BYTES) {
+        reject(new Error("request body too large"));
+        req.destroy();
+        return;
+      }
+      chunks.push(chunk);
+    });
+    req.on("end", () => {
+      const text = Buffer.concat(chunks).toString("utf-8").trim();
+      if (!text) return resolvePromise({});
+      try {
+        resolvePromise(JSON.parse(text));
+      } catch (err) {
+        reject(new Error("body is not valid JSON"));
+      }
+    });
+    req.on("error", reject);
+  });
+}
+
+// MeetingBar hands the Mac script a real Date; the script may send it as an ISO
+// string or as epoch ms. Anything unparseable is dropped so the caller falls
+// back to the default length rather than being rejected outright.
+function parseEndsAt(value) {
+  if (value == null) return undefined;
+  if (typeof value === "number") return Number.isFinite(value) ? value : undefined;
+  if (typeof value === "string") {
+    const parsed = Date.parse(value);
+    if (Number.isFinite(parsed)) return parsed;
+    const asNumber = Number(value);
+    return Number.isFinite(asNumber) && value.trim() !== "" ? asNumber : undefined;
+  }
+  return undefined;
+}
+
+function meetingStatusBody() {
+  if (!meetingSession) return { active: false, deviceId: meetingPlugDeviceId };
+  return {
+    active: true,
+    title: meetingSession.title,
+    owned: meetingSession.owned,
+    offAt: new Date(meetingSession.offAt).toISOString(),
+    minutesRemaining: Math.max(0, Math.round((meetingSession.offAt - Date.now()) / 60000)),
+    deviceId: meetingPlugDeviceId,
+  };
+}
+
+async function handleMeetingStart(body, res) {
+  const title = typeof body.title === "string" && body.title.trim() ? body.title.trim().slice(0, 120) : "untitled";
+  const request = {
+    endsAt: parseEndsAt(body.endsAt),
+    minutes: Number.isFinite(body.minutes) ? body.minutes : undefined,
+  };
+
+  // Only read the plug when starting fresh: mid-session it is on because we
+  // switched it on, and that read would wrongly look like a pre-existing "on".
+  let plugAlreadyOn = null;
+  if (!meetingSession) {
+    try {
+      plugAlreadyOn = await meetingStClient.getSwitchState(meetingPlugDeviceId);
+    } catch (err) {
+      logError("Could not read the meeting plug's state -- treating it as ours", err);
+    }
+  }
+
+  const plan = planMeetingStart({
+    request,
+    now: Date.now(),
+    session: meetingSession,
+    plugAlreadyOn,
+    cfg: MEETING_PLUG_CFG,
+  });
+
+  if (!(await setMeetingPlug(true))) {
+    return sendJson(res, 502, { error: "SmartThings would not switch the plug on" });
+  }
+
+  meetingSession = { offAt: plan.offAt, owned: plan.owned, title };
+  saveMeetingSession();
+
+  const until = new Date(plan.offAt).toISOString();
+  log(
+    `Meeting "${title}" -- plug on until ${until} ` +
+      `(${Math.round(plan.minutes)}min from ${plan.source}${plan.clamped ? ", clamped" : ""}; ${plan.reason})`
+  );
+  return sendJson(res, 200, {
+    ok: true,
+    ...meetingStatusBody(),
+    minutes: Math.round(plan.minutes),
+    source: plan.source,
+    clamped: plan.clamped,
+    extended: plan.extended,
+  });
+}
+
+async function handleMeetingEnd(res) {
+  if (!meetingSession) return sendJson(res, 200, { ok: true, active: false, note: "no meeting was running" });
+  const { title, owned } = meetingSession;
+  if (!owned) {
+    log(`Meeting "${title}" ended early -- plug was already on beforehand, leaving it on.`);
+    meetingSession = null;
+    saveMeetingSession();
+    return sendJson(res, 200, { ok: true, active: false, switchedOff: false });
+  }
+  if (!(await setMeetingPlug(false))) {
+    return sendJson(res, 502, { error: "SmartThings would not switch the plug off" });
+  }
+  log(`Meeting "${title}" ended early -- plug switched off.`);
+  meetingSession = null;
+  saveMeetingSession();
+  return sendJson(res, 200, { ok: true, active: false, switchedOff: true });
+}
+
+async function handleMeetingRequest(req, res) {
+  const path = new URL(req.url, "http://localhost").pathname.replace(/\/+$/, "") || "/";
+
+  if (!meetingAuthOk(req)) return sendJson(res, 401, { error: "unauthorized" });
+
+  if (req.method === "GET" && path === "/meeting/status") {
+    return sendJson(res, 200, meetingStatusBody());
+  }
+
+  // Discovery aid: this is how you find the plug's device id for .env.
+  if (req.method === "GET" && path === "/meeting/devices") {
+    const switches = (await meetingStClient.listDevices())
+      .filter(isSwitchDevice)
+      .map((d) => ({ deviceId: d.deviceId, label: meetingDeviceLabel(d) }));
+    return sendJson(res, 200, { switches });
+  }
+
+  const isStart = req.method === "POST" && path === "/meeting/start";
+  const isEnd = req.method === "POST" && path === "/meeting/end";
+  if (!isStart && !isEnd) return sendJson(res, 404, { error: "not found" });
+
+  // Retried here, not just at startup: a plug that was offline or renamed when
+  // the service booted resolves on the next meeting instead of needing a restart.
+  if (!(await resolveMeetingPlugDevice())) {
+    return sendJson(res, 503, {
+      error: "no meeting plug resolved -- set MEETING_PLUG_DEVICE_NAME (or MEETING_PLUG_DEVICE_ID); see GET /meeting/devices",
+    });
+  }
+
+  if (isEnd) return handleMeetingEnd(res);
+
+  let body;
+  try {
+    body = await readJsonBody(req);
+  } catch (err) {
+    return sendJson(res, 400, { error: err.message });
+  }
+  return handleMeetingStart(body, res);
+}
+
+function startMeetingPlugServer(stClient) {
+  meetingStClient = stClient;
+  meetingSession = loadMeetingSession();
+  if (meetingSession) {
+    log(`Restored meeting-plug session ("${meetingSession.title}") -- plug off at ${new Date(meetingSession.offAt).toISOString()}`);
+  }
+
+  resolveMeetingPlugDevice().catch((err) =>
+    logError("Could not look up the meeting plug now -- will retry on the first meeting", err)
+  );
+
+  meetingServer = createServer((req, res) => {
+    handleMeetingRequest(req, res).catch((err) => {
+      logError("Meeting-plug request failed", err);
+      if (!res.headersSent) sendJson(res, 500, { error: "internal error" });
+    });
+  });
+  meetingServer.on("error", (err) => logError(`Meeting-plug listener on ${MEETING_PLUG_HOST}:${MEETING_PLUG_PORT} failed`, err));
+  meetingServer.listen(MEETING_PLUG_PORT, MEETING_PLUG_HOST, () => {
+    log(`  Meeting plug: listening on ${MEETING_PLUG_HOST}:${MEETING_PLUG_PORT}`);
+  });
+
+  meetingTickTimer = setInterval(() => {
+    meetingTick().catch((err) => logError("Meeting-plug tick failed", err));
+  }, MEETING_PLUG_TICK_MS);
+  meetingTickTimer.unref();
+  // Catch up immediately in case the off time passed while we were down.
+  meetingTick().catch((err) => logError("Meeting-plug catch-up tick failed", err));
+}
+
+// ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
 
@@ -1151,6 +1544,20 @@ async function main() {
     log(`  Smoke-unlock: armed -> SmartThings lock ${ST_LOCK_DEVICE_ID} (cooldown ${SMOKE_UNLOCK_COOLDOWN_SECONDS}s)`);
   } else {
     log("  Smoke-unlock disabled (missing ST_CLIENT_ID / ST_CLIENT_SECRET / ST_REFRESH_TOKEN / ST_LOCK_DEVICE_ID)");
+  }
+  if (meetingPlugConfigured) {
+    log(
+      `  Meeting plug: "${MEETING_PLUG_DEVICE_NAME || MEETING_PLUG_DEVICE_ID}" | default ${MEETING_PLUG_DEFAULT_MINUTES}min, ` +
+        `bounds ${MEETING_PLUG_MIN_MINUTES}-${MEETING_PLUG_MAX_MINUTES}min | ` +
+        `already-on plugs ${MEETING_PLUG_RESPECT_EXISTING ? "left alone" : "taken over"}`
+    );
+  } else if (meetingPlugServerEnabled) {
+    log("  Meeting plug: no MEETING_PLUG_DEVICE_NAME set -- listener up for GET /meeting/devices only");
+  } else {
+    log("  Meeting plug disabled (missing MEETING_PLUG_TOKEN or the ST_* credentials)");
+  }
+  if (meetingPlugServerEnabled && MEETING_PLUG_TOKENS.length > 1) {
+    log(`  Meeting plug: ${MEETING_PLUG_TOKENS.length} client tokens accepted`);
   }
 
   const ringApi = new RingApi({
@@ -1242,7 +1649,7 @@ async function main() {
 
   subscribeSensors(sensors, ringApi, targetCamera);
 
-  if (smokeUnlockEnabled) {
+  if (smartThingsEnabled) {
     try {
       const stClient = createSmartThingsClient({
         clientId: ST_CLIENT_ID,
@@ -1253,8 +1660,11 @@ async function main() {
           persistEnvVar("ST_REFRESH_TOKEN", t);
         },
       });
-      setupSmokeUnlock(devices, stClient);
-      setupPanelAlarmWatch(devices, stClient);
+      if (smokeUnlockEnabled) {
+        setupSmokeUnlock(devices, stClient);
+        setupPanelAlarmWatch(devices, stClient);
+      }
+      if (meetingPlugServerEnabled) startMeetingPlugServer(stClient);
 
       // Keep the token warm. Two reasons this matters for a life-safety path:
       //  1. An unlock never has to wait on (or fail from) a cold refresh mid-alarm.
@@ -1271,7 +1681,7 @@ async function main() {
       await keepTokenFresh(); // validate creds now, surfacing problems at startup
       setInterval(keepTokenFresh, 12 * 60 * 60 * 1000).unref();
     } catch (err) {
-      logError("SmartThings setup failed -- smoke-unlock disabled this run", err);
+      logError("SmartThings setup failed -- smoke-unlock and meeting plug disabled this run", err);
     }
   }
 
@@ -1295,6 +1705,10 @@ async function main() {
 function shutdown(signal) {
   log(`Shutting down (${signal})...`);
   if (healthCheckTimer) clearInterval(healthCheckTimer);
+  if (meetingTickTimer) clearInterval(meetingTickTimer);
+  // The session file is left in place on purpose: it is how a restart knows a
+  // meeting is still running and the plug is still owed an off.
+  try { meetingServer?.close(); } catch (_) {}
   try { dirigera?.stopListeningForUpdates(); } catch (_) {}
   process.exit(0);
 }

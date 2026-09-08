@@ -35,14 +35,16 @@ cd "$(dirname "$0")"
 say()  { printf '\n\033[1m==> %s\033[0m\n' "$*"; }
 fail() { printf '\n\033[31mERROR: %s\033[0m\n' "$*" >&2; exit 1; }
 
-# Never transferred. .env and blind-sensor-map.json are the Pi's own; the rest
-# is either local build state or meaningless on the target.
+# Never transferred. .env, blind-sensor-map.json and the meeting-plug session
+# file are the Pi's own -- pruning the session file mid-meeting would strand the
+# plug on. The rest is local build state or meaningless on the target.
 EXCLUDES=(
   --exclude .git
   --exclude node_modules
   --exclude .env
   --exclude .env.pi.bak
   --exclude blind-sensor-map.json
+  --exclude .meeting-plug-state.json
   --exclude .DS_Store
   --exclude scratchpad
 )

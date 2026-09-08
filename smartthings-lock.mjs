@@ -1,9 +1,13 @@
 /**
- * SmartThings OAuth2 lock client.
+ * SmartThings OAuth2 client.
  *
- * The Ultraloq lock is linked into SmartThings (cloud-to-cloud), so we drive it
- * through the official SmartThings REST API. Covers what this project needs:
- * OAuth2 token handling and the lock/unlock command.
+ * The Ultraloq lock and the Zigbee meeting plug are both linked into
+ * SmartThings (cloud-to-cloud), so we drive them through the official
+ * SmartThings REST API. Covers what this project needs: OAuth2 token handling,
+ * the lock/unlock command, and switch on/off plus its state.
+ *
+ * One client instance per process, deliberately: refresh tokens rotate (see
+ * below), so two clients sharing a token would invalidate each other.
  *
  *   - Authorize:  https://api.smartthings.com/oauth/authorize
  *   - Token:      https://api.smartthings.com/oauth/token   (HTTP Basic auth)
@@ -125,10 +129,14 @@ export function createSmartThingsClient({ clientId, clientSecret, refreshToken, 
     return json;
   }
 
-  function sendLockCommand(deviceId, command) {
+  function sendCommand(deviceId, capability, command) {
     return apiRequest("POST", `/devices/${deviceId}/commands`, {
-      commands: [{ component: "main", capability: "lock", command }],
+      commands: [{ component: "main", capability, command }],
     });
+  }
+
+  function sendLockCommand(deviceId, command) {
+    return sendCommand(deviceId, "lock", command);
   }
 
   return {
@@ -144,6 +152,23 @@ export function createSmartThingsClient({ clientId, clientSecret, refreshToken, 
     /** Send the lock command (handy for manual testing). */
     lockLock(deviceId) {
       return sendLockCommand(deviceId, "lock");
+    },
+    /** Switch a plug/outlet on or off. */
+    setSwitch(deviceId, on) {
+      return sendCommand(deviceId, "switch", on ? "on" : "off");
+    },
+    /**
+     * Read a switch's current state.
+     *
+     * Returns true/false, or null when the device reports no switch value --
+     * an unreachable plug must not be mistaken for one that is off.
+     */
+    async getSwitchState(deviceId) {
+      const json = await apiRequest("GET", `/devices/${deviceId}/status`);
+      const value = json?.components?.main?.switch?.switch?.value;
+      if (value === "on") return true;
+      if (value === "off") return false;
+      return null;
     },
     /** Force a token refresh; used to validate credentials. */
     ensureAccessToken,

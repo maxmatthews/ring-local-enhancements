@@ -2,8 +2,9 @@
 
 ## Checks
 
-- `npm test` — unit tests for the level-sync decision logic
-  (`level-sync.mjs`). Pure and offline; run before deploying.
+- `npm test` — unit tests for the level-sync and meeting-plug decision
+  logic (`level-sync.mjs`, `meeting-plug.mjs`). Pure and offline; run
+  before deploying.
 - `npm run diag` — read-only report of live blind levels and what the
   level-sync logic would decide. Needs LAN access to the Dirigera hub, so
   run it on the Pi. `--apply` makes it act.
@@ -20,6 +21,9 @@
   is the only record of what's running.
 - `.env` and `blind-sensor-map.json` exist **only on the Pi** and are never
   transferred or deleted by the deploy. Don't overwrite them with local copies.
+- `.meeting-plug-state.json` is the Pi's own live state (the meeting currently
+  holding the plug on). It's excluded from the deploy on purpose — pruning it
+  mid-meeting would strand the plug on.
 - Managed by pm2 (`ecosystem.config.cjs`), running under the pi user's pm2
   daemon (`pm2-pi.service`), consistent with the other projects on this Pi.
 - `journal-cleaner` stays on its systemd timer — it's a system-level

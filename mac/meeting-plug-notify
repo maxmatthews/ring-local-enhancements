@@ -1,0 +1,153 @@
+#!/bin/sh
+#
+# Tell the Pi that a meeting started (or ended), so it can drive the plug.
+#
+#   meeting-plug-notify --minutes 30 --title "Standup"
+#   meeting-plug-notify --end
+#   meeting-plug-notify --status
+#
+# Called by the MeetingBar join script. The real logic lives here rather than in
+# the .scpt because MeetingBar rewrites that file whenever you edit the script
+# in its Preferences window -- config kept in there would be lost.
+#
+# Config, in ~/.config/meeting-plug/config:
+#   MEETING_PLUG_URL=http://pi.local:8787
+#   MEETING_PLUG_TOKEN=...
+#
+# MEETING_PLUG_URL may list several URLs, comma or space separated. They are
+# tried in order and the first that answers wins -- useful as a fallback for
+# when mDNS is being unreliable:
+#   MEETING_PLUG_URL=http://pi.local:8787, http://192.168.1.104:8787
+#
+# This is home-LAN only by design. Off the LAN nothing is reachable, so the
+# call fails, is logged, and is otherwise silent -- no alert, no delay to
+# joining the meeting, no retry.
+
+set -eu
+
+CONFIG="${MEETING_PLUG_CONFIG:-$HOME/.config/meeting-plug/config}"
+LOG="${MEETING_PLUG_LOG:-$HOME/Library/Logs/meeting-plug.log}"
+
+log() {
+  mkdir -p "$(dirname "$LOG")" 2>/dev/null || true
+  printf '%s %s\n' "$(date '+%Y-%m-%dT%H:%M:%S%z')" "$*" >> "$LOG" 2>/dev/null || true
+}
+
+if [ ! -r "$CONFIG" ]; then
+  log "ERROR no config at $CONFIG"
+  echo "No config at $CONFIG" >&2
+  exit 1
+fi
+
+# Parsed rather than sourced. Sourcing would execute whatever is in the file,
+# and an unquoted multi-URL value (which contains a space) would be split into
+# a command by the shell before we ever saw it.
+MEETING_PLUG_URL=""
+MEETING_PLUG_TOKEN=""
+while IFS= read -r line || [ -n "$line" ]; do
+  case "$line" in ''|\#*) continue ;; esac
+  case "$line" in *=*) : ;; *) continue ;; esac
+  key=${line%%=*}
+  val=${line#*=}
+  # Trim spaces around the key, leading spaces and surrounding quotes off the value.
+  key=$(printf '%s' "$key" | tr -d '[:space:]')
+  while [ "${val# }" != "$val" ]; do val=${val# }; done
+  case "$val" in
+    \"*\") val=${val#\"}; val=${val%\"} ;;
+    "'"*"'") val=${val#"'"}; val=${val%"'"} ;;
+  esac
+  case "$key" in
+    MEETING_PLUG_URL)   MEETING_PLUG_URL=$val ;;
+    MEETING_PLUG_TOKEN) MEETING_PLUG_TOKEN=$val ;;
+  esac
+done < "$CONFIG"
+
+if [ -z "${MEETING_PLUG_URL:-}" ] || [ -z "${MEETING_PLUG_TOKEN:-}" ]; then
+  log "ERROR MEETING_PLUG_URL / MEETING_PLUG_TOKEN not set in $CONFIG"
+  echo "MEETING_PLUG_URL and MEETING_PLUG_TOKEN must be set in $CONFIG" >&2
+  exit 1
+fi
+
+ACTION=start
+MINUTES=""
+TITLE=""
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --minutes) MINUTES="${2:-}"; shift 2 ;;
+    --title)   TITLE="${2:-}"; shift 2 ;;
+    --end)     ACTION=end; shift ;;
+    --status)  ACTION=status; shift ;;
+    *) echo "Unknown option: $1" >&2; exit 2 ;;
+  esac
+done
+
+# Minimal JSON string escaping: backslash, double quote, and control characters
+# (a meeting title is arbitrary user text and routinely contains quotes).
+json_escape() {
+  printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' | tr -d '\000-\037'
+}
+
+case "$ACTION" in
+  status) METHOD=GET;  ENDPATH="/meeting/status"; BODY="" ;;
+  end)    METHOD=POST; ENDPATH="/meeting/end";    BODY="{}" ;;
+  start)
+    METHOD=POST
+    ENDPATH="/meeting/start"
+    BODY="{\"title\":\"$(json_escape "${TITLE:-untitled}")\""
+    # A non-positive or non-numeric duration is simply left out, which is what
+    # makes the Pi fall back to its default meeting length.
+    case "$MINUTES" in
+      ''|*[!0-9]*|0) : ;;
+      *) BODY="$BODY,\"minutes\":$MINUTES" ;;
+    esac
+    BODY="$BODY}"
+    ;;
+esac
+
+# Try each configured URL in turn; the first that answers wins. Timeouts are
+# deliberately short: off the home LAN nothing here is reachable, and this runs
+# while MeetingBar is opening the meeting link.
+#
+# Every curl status is captured with `|| RC=$?`: under `set -e` a bare failing
+# assignment would abort the script before we could try the next URL.
+ATTEMPTS=""
+STATUS=1
+RESPONSE=""
+REACHED=""
+for BASE in $(printf '%s' "$MEETING_PLUG_URL" | tr ',' ' '); do
+  BASE="${BASE%/}"
+  [ -n "$BASE" ] || continue
+  ATTEMPTS="$ATTEMPTS $BASE"
+  RC=0
+  if [ "$METHOD" = "GET" ]; then
+    OUT=$(curl -fsS --connect-timeout 3 --max-time 6 -H "Authorization: Bearer $MEETING_PLUG_TOKEN" "$BASE$ENDPATH" 2>&1) || RC=$?
+  else
+    OUT=$(curl -fsS --connect-timeout 3 --max-time 6 -X POST "$BASE$ENDPATH" \
+      -H "Authorization: Bearer $MEETING_PLUG_TOKEN" \
+      -H "Content-Type: application/json" \
+      -d "$BODY" 2>&1) || RC=$?
+  fi
+  RESPONSE="$OUT"
+  if [ "$RC" -eq 0 ]; then
+    STATUS=0
+    REACHED="$BASE"
+    break
+  fi
+done
+
+if [ "$STATUS" -eq 0 ]; then
+  log "$ACTION ok via $REACHED: $BODY -> $RESPONSE"
+  if [ "$ACTION" = "status" ]; then
+    printf '%s\n' "$RESPONSE"
+  fi
+  exit 0
+fi
+
+# Never fail loudly: this runs while MeetingBar is opening a meeting link, and a
+# plug that didn't switch on must not get in the way of joining the call.
+log "$ACTION FAILED (tried$ATTEMPTS): $BODY -> $RESPONSE"
+if [ "$ACTION" = "status" ]; then
+  printf 'Could not reach the Pi (tried%s): %s\n' "$ATTEMPTS" "$RESPONSE" >&2
+fi
+exit 1

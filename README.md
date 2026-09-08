@@ -1,7 +1,7 @@
 # Ring local enhancements
 
 Local-network glue for a Ring + IKEA Dirigera home. One Node service
-(`index.mjs`) running four automations that neither vendor offers natively:
+(`index.mjs`) running five automations that neither vendor offers natively:
 
 | # | Feature | Needs | Off switch |
 | --- | --- | --- | --- |
@@ -9,6 +9,7 @@ Local-network glue for a Ring + IKEA Dirigera home. One Node service
 | 2 | **Sunset blind close, gated by door state** — close every Dirigera blind at local sunset, but not while its mapped door is open | Ring + Dirigera | omit any `DIRIGERA_*` / `LATITUDE` / `LONGITUDE` |
 | 3 | **Smoke/CO auto-unlock** — unlock an Ultraloq lock via SmartThings when the Ring Alarm panel reports a fire or CO alarm | Ring + SmartThings | omit any `ST_*` |
 | 4 | **Level-sync retry** — re-send a house-wide blind level to the blinds that missed it, plus a full-open nudge | Ring + Dirigera | `BLIND_LEVEL_SYNC_ENABLED=false` |
+| 5 | **Meeting-triggered smart plug** — switch a SmartThings plug on when MeetingBar joins a meeting, off when the meeting is scheduled to end | Ring + SmartThings + a Mac | omit `MEETING_PLUG_TOKEN` |
 
 Each feature degrades independently: missing config disables just that
 feature and logs why at startup, and a setup failure (Dirigera unreachable,
@@ -189,6 +190,138 @@ nudge). Both the service and the diag call the same function.
 
 ---
 
+## 5. Meeting-triggered smart plug
+
+Joining a meeting in [MeetingBar](https://github.com/leits/MeetingBar) on the
+Mac switches a Zigbee plug on (here: the "Logo Light"), and it switches off
+again when the meeting was scheduled to end. If the meeting length can't be
+worked out, it runs for `MEETING_PLUG_DEFAULT_MINUTES` (default 60).
+
+```
+Mac: MeetingBar joins a meeting
+      -> joinEventScript.scpt   (gets the event, incl. its real end date)
+      -> ~/.local/bin/meeting-plug-notify
+      -> POST /meeting/start {"title": "...", "minutes": 30}
+
+Pi:  switch the plug on now, remember "off at 14:30"
+      -> a tick every MEETING_PLUG_TICK_MS switches it off when that passes
+```
+
+**Why the schedule lives on the Pi, not the Mac.** The laptop is usually shut
+the moment a meeting ends, and a sleeping Mac switches nothing off. The Pi is
+always up, so the off lands on time no matter what the laptop does.
+
+**Why it runs inside `index.mjs` rather than as its own script.** SmartThings
+rotates the refresh token on every use. A second client with its own copy of
+the token would silently invalidate the one the smoke-unlock path (feature 3)
+depends on, so both features share the single client this service already has.
+
+### Behaviour
+
+- **Overlapping and back-to-back meetings** extend the off time; they never
+  retract it. A 15-minute call joined inside an hour-long one can't cut the
+  hour short.
+- **A plug that was already on** when the first meeting started is left on at
+  the end — you switched it on, so it isn't ours to switch off. Set
+  `MEETING_PLUG_RESPECT_EXISTING=false` to switch off regardless.
+- **All-day events are ignored** by the Mac script.
+- **A silly end date is clamped** to `MEETING_PLUG_MIN_MINUTES` ..
+  `MEETING_PLUG_MAX_MINUTES`, so one bad event can't leave the plug on for days.
+- **Restarts are survived.** The session is written to
+  `.meeting-plug-state.json` on the Pi; a deploy mid-meeting reloads it and
+  still switches off on time, including catching up on an off time that fell
+  while the service was down.
+- **Failures are quiet on the Mac.** A plug that doesn't answer must never
+  delay or block joining the actual call.
+
+### MeetingBar version matters
+
+| MeetingBar | Join hook gets event data? | Result |
+| --- | --- | --- |
+| **v5.0.0+** | yes — `execute(withAppleEvent:)` | real meeting length |
+| **4.11.6 and earlier** | no — `execute { }`, zero parameters | always the 60-minute default |
+
+The bundled script handles both: it defines a `meetingStart` handler for the
+14-parameter payload and a bare `run` handler for older builds. Only the
+accuracy of the off time differs.
+
+### Setup
+
+On the **Pi**, add to `.env` (the `ST_*` credentials from feature 3 are reused
+as-is — do not create a second set):
+
+```sh
+MEETING_PLUG_DEVICE_NAME=Logo Light
+MEETING_PLUG_TOKEN=$(openssl rand -hex 24)
+```
+
+Deploy, then confirm the plug resolved:
+
+```sh
+curl -H "Authorization: Bearer $MEETING_PLUG_TOKEN" http://pi.local:8787/meeting/status
+```
+
+On the **Mac**:
+
+```sh
+mac/install-meeting-plug.sh --url http://pi.local:8787 --token <the same token>
+```
+
+`--url` accepts a comma-separated list, tried in order — handy as a fallback
+when mDNS is flaky:
+
+```sh
+mac/install-meeting-plug.sh --url "http://pi.local:8787, http://192.168.1.104:8787" --token ...
+```
+
+Then in MeetingBar → Preferences → Advanced, tick **"Run AppleScript when
+joining a meeting"** and click **"Edit script"** once, selecting
+*User → Library → Application Scripts → leits.MeetingBar* (this grants the
+sandbox bookmark; without it the script never runs).
+
+### More than one Mac
+
+Any number of Macs can drive the same plug — run the installer on each. Give
+each machine its own token and list them all in the Pi's `MEETING_PLUG_TOKEN`,
+so a machine can be cut off on its own (handing back a work laptop, say)
+without re-keying the others:
+
+```sh
+# on the Pi, in .env
+MEETING_PLUG_TOKEN=<personal mac token>,<work mac token>
+```
+
+Meetings from different machines merge the same way overlapping meetings on one
+machine do: the latest end time wins, so a call on the work laptop can't switch
+the plug off while a call on the personal one is still running.
+
+**This is home-LAN only, by design.** Off the LAN the Pi is unreachable, so the
+call fails after a 3-second connect timeout, is written to
+`~/Library/Logs/meeting-plug.log`, and is otherwise completely silent — no
+alert, and no delay to joining the meeting.
+
+### Endpoints
+
+All require `Authorization: Bearer $MEETING_PLUG_TOKEN`.
+
+| Method | Path | Purpose |
+| --- | --- | --- |
+| `GET` | `/meeting/status` | What the Pi thinks is running, and when it switches off |
+| `GET` | `/meeting/devices` | Every SmartThings device with a `switch` capability — how you find a plug's name or id |
+| `POST` | `/meeting/start` | `{"title": "...", "minutes": 30}` — `minutes` optional; omit it to get the default |
+| `POST` | `/meeting/end` | Switch off now, ending the meeting early |
+
+### Troubleshooting
+
+```sh
+tail -f ~/Library/Logs/meeting-plug.log      # on the Mac: every call and its reply
+~/.local/bin/meeting-plug-notify --status    # on the Mac: is the Pi reachable?
+~/.local/bin/meeting-plug-notify --end       # switch off now
+```
+
+Nothing in the log at all means MeetingBar never ran the script — check the
+"Run AppleScript when joining a meeting" tick and the folder bookmark above.
+
 ## How it works
 
 - Connects to Ring via `ring-client-api` using a refresh token, and to the
@@ -323,7 +456,7 @@ is logged with a `WARN:` line at startup.
 | Command | What it does |
 | --- | --- |
 | `npm start` | Run the service in the foreground |
-| `npm test` | Unit tests for the level-sync decision logic. Pure and offline. |
+| `npm test` | Unit tests for the level-sync and meeting-plug decision logic. Pure and offline. |
 | `npm run diag` | Read-only live report of blind levels + what level-sync would do (`--apply` to act). Needs LAN access to the hub — run it on the Pi. |
 | `npm run deploy` | Deploy to the Pi (`--dry-run`, `--prune`) |
 | `npm run auth` | Mint a Ring refresh token (interactive 2FA) |
@@ -446,6 +579,23 @@ feature 3 stays off.
 | `ST_REFRESH_TOKEN` | (optional) | From `npm run pair-smartthings`. Rotates on every refresh; auto-persisted. |
 | `ST_LOCK_DEVICE_ID` | (optional) | SmartThings device ID of the lock |
 | `SMOKE_UNLOCK_COOLDOWN_SECONDS` | `300` | Min gap between successful unlocks |
+| `ST_REDIRECT_URI` | `https://httpbin.org/get` | Redirect URI for the one-time pairing flow only |
+
+**Meeting plug** — feature 5. Reuses the `ST_*` credentials above. Without
+`MEETING_PLUG_TOKEN` the listener never starts, so the feature is off.
+
+| Variable | Default | Description |
+| --- | --- | --- |
+| `MEETING_PLUG_TOKEN` | (optional) | Bearer token(s) the Macs send. Comma-separate one per machine so each can be revoked alone. Required to enable the feature |
+| `MEETING_PLUG_DEVICE_NAME` | (optional) | Plug's name in the SmartThings app, e.g. `Logo Light`. Exact match wins over substring |
+| `MEETING_PLUG_DEVICE_ID` | (optional) | Pin the device id outright instead of looking the name up |
+| `MEETING_PLUG_PORT` | `8787` | Listener port |
+| `MEETING_PLUG_HOST` | `0.0.0.0` | Listener bind address |
+| `MEETING_PLUG_DEFAULT_MINUTES` | `60` | Used when the meeting length can't be worked out |
+| `MEETING_PLUG_MIN_MINUTES` | `5` | Floor on the computed run time |
+| `MEETING_PLUG_MAX_MINUTES` | `240` | Ceiling — stops one bad end date leaving the plug on for days |
+| `MEETING_PLUG_RESPECT_EXISTING` | `true` | Leave a plug that was already on alone at the end |
+| `MEETING_PLUG_TICK_MS` | `20000` | Off-time check interval, and the worst-case lateness of an off |
 | `ST_REDIRECT_URI` | `https://httpbin.org/get` | Only used by `npm run pair-smartthings`; must be public HTTPS and match the OAuth app exactly |
 
 Non-`.env` knobs live at the top of `index.mjs`: `CLOSE_ORDER` (sunset close
@@ -526,12 +676,15 @@ for more than ~30 days, re-run `npm run pair-smartthings`.
 
 | File | Role |
 | --- | --- |
-| `index.mjs` | The service: all four automations, config, lifecycle |
+| `index.mjs` | The service: all five automations, config, lifecycle |
 | `hub-discovery.mjs` | mDNS lookup of the Dirigera hub, preferring IPv4 (`discoverDirigeraHost`) |
 | `level-sync.mjs` | Pure decision logic for the level-sync retry (`planLevelSync`) |
 | `test-level-sync.mjs` | Unit tests for the above (`npm test`) |
 | `diag-level-sync.mjs` | Live read-only diagnostic (`npm run diag`) |
-| `smartthings-lock.mjs` | SmartThings OAuth2 + lock/unlock/list-devices client |
+| `smartthings-lock.mjs` | SmartThings OAuth2 client: lock/unlock, switch on/off, list devices |
+| `meeting-plug.mjs` | Pure decision logic for the meeting plug (`planMeetingStart`, `planTick`) |
+| `test-meeting-plug.mjs` | Unit tests for the above (`npm test`) |
+| `mac/` | The Mac half of feature 5: MeetingBar join script, helper, installer |
 | `pair-smartthings.mjs` | One-time SmartThings OAuth pairing helper |
 | `deploy.sh` | rsync + test + pm2 restart deploy to the Pi |
 | `ecosystem.config.cjs` | pm2 app definition |
@@ -539,8 +692,8 @@ for more than ~30 days, re-run `npm run pair-smartthings`.
 | `update-node.cron` | Reference copy of `/etc/cron.weekly/update-node` on the Pi — weekly Node upgrade + pm2 migration |
 | `.env.example`, `blind-sensor-map.json.example` | Tracked templates |
 
-`.env`, `.env.pi.bak` and `blind-sensor-map.json` are gitignored and exist only
-where they're used. Never put real secrets in `.env.example`.
+`.env`, `.env.pi.bak`, `blind-sensor-map.json` and `.meeting-plug-state.json`
+are gitignored and exist only where they're used. Never put real secrets in `.env.example`.
 
 ## Caveats
 
