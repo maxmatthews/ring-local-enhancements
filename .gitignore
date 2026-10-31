@@ -3,3 +3,4 @@
 node_modules/*
 blind-sensor-map.json
 .meeting-plug-state.json
+.govee-lights-state.json

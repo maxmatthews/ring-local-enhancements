@@ -2,8 +2,9 @@
 
 ## Checks
 
-- `npm test` — unit tests for the level-sync and meeting-plug decision
-  logic (`level-sync.mjs`, `meeting-plug.mjs`). Pure and offline; run
+- `npm test` — unit tests for the level-sync, meeting-plug, blind-hold and
+  Govee-lights decision logic (`level-sync.mjs`, `meeting-plug.mjs`,
+  `blind-holds.mjs`, `govee-lights.mjs`). Pure and offline; run
   before deploying.
 - `npm run diag` — read-only report of live blind levels and what the
   level-sync logic would decide. Needs LAN access to the Dirigera hub, so
@@ -24,6 +25,8 @@
 - `.meeting-plug-state.json` is the Pi's own live state (the meeting currently
   holding the plug on). It's excluded from the deploy on purpose — pruning it
   mid-meeting would strand the plug on.
+- `.govee-lights-state.json` is likewise the Pi's own (which of tonight's
+  on/off already fired, and the last scene shown) and excluded from the deploy.
 - Managed by pm2 (`ecosystem.config.cjs`), running under the pi user's pm2
   daemon (`pm2-pi.service`), consistent with the other projects on this Pi.
 - `journal-cleaner` stays on its systemd timer — it's a system-level

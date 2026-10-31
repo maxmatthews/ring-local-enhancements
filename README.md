@@ -1,7 +1,7 @@
 # Ring local enhancements
 
 Local-network glue for a Ring + IKEA Dirigera home. One Node service
-(`index.mjs`) running five automations that neither vendor offers natively:
+(`index.mjs`) running six automations that neither vendor offers natively:
 
 | # | Feature | Needs | Off switch |
 | --- | --- | --- | --- |
@@ -10,6 +10,7 @@ Local-network glue for a Ring + IKEA Dirigera home. One Node service
 | 3 | **Smoke/CO auto-unlock** — unlock an Ultraloq lock via SmartThings when the Ring Alarm panel reports a fire or CO alarm | Ring + SmartThings | omit any `ST_*` |
 | 4 | **Level-sync retry** — re-send a house-wide blind level to the blinds that missed it, plus a full-open nudge | Ring + Dirigera | `BLIND_LEVEL_SYNC_ENABLED=false` |
 | 5 | **Meeting-triggered smart plug** — switch a SmartThings plug on when MeetingBar joins a meeting, off when the meeting is scheduled to end | Ring + SmartThings + a Mac | omit `MEETING_PLUG_TOKEN` |
+| 6 | **Govee outdoor lights** — permanent outdoor lights on at sunset and off at 23:15, with a random holiday scene in the run-up to a holiday | Govee + `LATITUDE` / `LONGITUDE` | omit `GOVEE_API_KEY` |
 
 Each feature degrades independently: missing config disables just that
 feature and logs why at startup, and a setup failure (Dirigera unreachable,
@@ -327,6 +328,38 @@ tail -f ~/Library/Logs/meeting-plug.log      # on the Mac: every call and its re
 
 Nothing in the log at all means MeetingBar never ran the script — check the
 "Run AppleScript when joining a meeting" tick and the folder bookmark above.
+
+## 6. Govee outdoor lights
+
+The Govee permanent outdoor lights ("Outdoor House Lights") switch on at local
+sunset and off at `GOVEE_OFF_TIME` (default 23:15), every night.
+
+- **Ordinary nights** show `GOVEE_DEFAULT_SCENE` (default "Nebula").
+- **Holiday run-up**: from `GOVEE_HOLIDAY_LEAD_DAYS` (default 7) days before a
+  holiday through the day itself, each night picks a random scene from that
+  holiday's list, never repeating the previous night's when there's a choice.
+- **Christmas** runs the whole of December, outranking New Year's lead-in;
+  New Year's Day itself still gets its own scenes.
+- **Memorial Day and Labor Day** run only their Saturday-to-Monday weekend.
+
+The calendar lives in `HOLIDAYS` in `govee-lights.mjs`: Christmas, New Year's
+Day, Valentine's Day, St. Patrick's Day, Easter, Memorial Day, Independence
+Day, Labor Day, Halloween and Thanksgiving. Floating dates (Easter, the Monday
+holidays, Thanksgiving) are computed per year. Where windows
+overlap the holiday listed first wins. Scene names must match the Govee app's
+built-in scene names; a holiday whose scenes the device doesn't offer falls
+back to the default.
+
+**Edges, not levels.** On and off each fire once per night, recorded in
+`.govee-lights-state.json` on the Pi. So switching the lights off from the
+Govee app at 9pm sticks, and a restart or deploy mid-evening doesn't re-pick
+the scene. A service that was down at sunset still switches on when it comes
+back, as long as it's before the off time. A failed command isn't recorded and
+is retried every `GOVEE_TICK_MS`.
+
+This uses the Govee cloud API (`govee.mjs`), so it needs internet access, not
+the LAN. Get a key in the Govee Home app: Profile → Settings → Apply for API
+Key, then set `GOVEE_API_KEY` in the Pi's `.env`.
 
 ## How it works
 
@@ -688,7 +721,7 @@ for more than ~30 days, re-run `npm run pair-smartthings`.
 
 | File | Role |
 | --- | --- |
-| `index.mjs` | The service: all five automations, config, lifecycle |
+| `index.mjs` | The service: all six automations, config, lifecycle |
 | `hub-discovery.mjs` | mDNS lookup of the Dirigera hub, preferring IPv4 (`discoverDirigeraHost`) |
 | `level-sync.mjs` | Pure decision logic for the level-sync retry (`planLevelSync`) |
 | `test-level-sync.mjs` | Unit tests for the above (`npm test`) |
@@ -698,6 +731,9 @@ for more than ~30 days, re-run `npm run pair-smartthings`.
 | `smartthings-lock.mjs` | SmartThings OAuth2 client: lock/unlock, switch on/off, list devices |
 | `meeting-plug.mjs` | Pure decision logic for the meeting plug (`planMeetingStart`, `planTick`) |
 | `test-meeting-plug.mjs` | Unit tests for the above (`npm test`) |
+| `govee.mjs` | Govee cloud API client: devices, scenes, power, set scene |
+| `govee-lights.mjs` | Pure schedule + holiday calendar for the outdoor lights (`pickScene`, `planLights`) |
+| `test-govee-lights.mjs` | Unit tests for the above (`npm test`) |
 | `mac/` | The Mac half of feature 5: MeetingBar join script, helper, installer |
 | `pair-smartthings.mjs` | One-time SmartThings OAuth pairing helper |
 | `deploy.sh` | rsync + test + pm2 restart deploy to the Pi |
@@ -706,8 +742,8 @@ for more than ~30 days, re-run `npm run pair-smartthings`.
 | `update-node.cron` | Reference copy of `/etc/cron.weekly/update-node` on the Pi — weekly Node upgrade + pm2 migration |
 | `.env.example`, `blind-sensor-map.json.example` | Tracked templates |
 
-`.env`, `.env.pi.bak`, `blind-sensor-map.json` and `.meeting-plug-state.json`
-are gitignored and exist only where they're used. Never put real secrets in `.env.example`.
+`.env`, `.env.pi.bak`, `blind-sensor-map.json`, `.meeting-plug-state.json` and
+`.govee-lights-state.json` are gitignored and exist only where they're used. Never put real secrets in `.env.example`.
 
 ## Caveats
 

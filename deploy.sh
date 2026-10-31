@@ -35,9 +35,9 @@ cd "$(dirname "$0")"
 say()  { printf '\n\033[1m==> %s\033[0m\n' "$*"; }
 fail() { printf '\n\033[31mERROR: %s\033[0m\n' "$*" >&2; exit 1; }
 
-# Never transferred. .env, blind-sensor-map.json and the meeting-plug session
-# file are the Pi's own -- pruning the session file mid-meeting would strand the
-# plug on. The rest is local build state or meaningless on the target.
+# Never transferred. .env, blind-sensor-map.json and the meeting-plug and Govee
+# state files are the Pi's own -- pruning the session file mid-meeting would
+# strand the plug on, and pruning the Govee one would re-pick tonight's scene. The rest is local build state or meaningless on the target.
 EXCLUDES=(
   --exclude .git
   --exclude node_modules
@@ -45,6 +45,7 @@ EXCLUDES=(
   --exclude .env.pi.bak
   --exclude blind-sensor-map.json
   --exclude .meeting-plug-state.json
+  --exclude .govee-lights-state.json
   --exclude .DS_Store
   --exclude scratchpad
 )

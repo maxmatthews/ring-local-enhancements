@@ -7,6 +7,8 @@
  *      whose mapped contact sensor reports open -- the blind closes
  *      POST_CLOSE_DELAY_SECONDS after the sensor transitions back to closed.
  *      Blinds with no mapping always close.
+ *   3. Switches Govee permanent outdoor lights on at sunset and off at a fixed
+ *      time, with a holiday scene in the run-up to a holiday (govee-lights.mjs).
  *
  * The Dirigera hub has no native Ring integration; the sunset trigger lives
  * here. Disable the equivalent scene in the IKEA Home Smart app so the two
@@ -20,6 +22,8 @@ import { planMeetingStart, planTick } from "./meeting-plug.mjs";
 import { discoverDirigeraHost } from "./hub-discovery.mjs";
 import { planLevelSync } from "./level-sync.mjs";
 import { holdOpenReason } from "./blind-holds.mjs";
+import { createGoveeClient } from "./govee.mjs";
+import { pickScene, planLights, localDateKey, timeOnDay, DEFAULT_SCENE, DEFAULT_LEAD_DAYS } from "./govee-lights.mjs";
 import SunCalc from "suncalc";
 import { createServer } from "http";
 import { timingSafeEqual } from "crypto";
@@ -115,6 +119,15 @@ const MEETING_PLUG_MAX_MINUTES = parseInt(process.env.MEETING_PLUG_MAX_MINUTES |
 const MEETING_PLUG_RESPECT_EXISTING =
   (process.env.MEETING_PLUG_RESPECT_EXISTING || "true").toLowerCase() !== "false";
 const MEETING_PLUG_TICK_MS = parseInt(process.env.MEETING_PLUG_TICK_MS || "20000", 10);
+// Govee permanent outdoor lights: on at sunset, off at GOVEE_OFF_TIME, holiday
+// scenes in the lead-up to a holiday (see govee-lights.mjs for the calendar).
+const GOVEE_API_KEY = process.env.GOVEE_API_KEY;
+const GOVEE_DEVICE_NAME = process.env.GOVEE_DEVICE_NAME || "Outdoor House Lights";
+const GOVEE_DEFAULT_SCENE = process.env.GOVEE_DEFAULT_SCENE || DEFAULT_SCENE;
+const GOVEE_OFF_TIME = process.env.GOVEE_OFF_TIME || "23:15";
+const GOVEE_SUNSET_OFFSET_MINUTES = parseInt(process.env.GOVEE_SUNSET_OFFSET_MINUTES || "0", 10);
+const GOVEE_HOLIDAY_LEAD_DAYS = parseInt(process.env.GOVEE_HOLIDAY_LEAD_DAYS || String(DEFAULT_LEAD_DAYS), 10);
+const GOVEE_TICK_MS = parseInt(process.env.GOVEE_TICK_MS || "60000", 10);
 const SMOKE_UNLOCK_COOLDOWN_SECONDS = parseInt(process.env.SMOKE_UNLOCK_COOLDOWN_SECONDS || "300", 10);
 const BLIND_CLOSED_LEVEL = 100;
 const BLIND_CLOSE_SPACING_MS = 10 * 1000;
@@ -192,6 +205,7 @@ const smokeUnlockEnabled = !!(ST_CLIENT_ID && ST_CLIENT_SECRET && ST_REFRESH_TOK
 // -- an unauthenticated switch on the LAN is not a reasonable default.
 const meetingPlugServerEnabled = !!(ST_CLIENT_ID && ST_CLIENT_SECRET && ST_REFRESH_TOKEN && MEETING_PLUG_TOKENS.length);
 const meetingPlugConfigured = !!(meetingPlugServerEnabled && (MEETING_PLUG_DEVICE_ID || MEETING_PLUG_DEVICE_NAME));
+const goveeLightsEnabled = !!(GOVEE_API_KEY && Number.isFinite(LATITUDE) && Number.isFinite(LONGITUDE));
 // One SmartThings client serves both features. Two would fight: refresh tokens
 // rotate on every use, so a second client would invalidate the first one's.
 const smartThingsEnabled = smokeUnlockEnabled || meetingPlugServerEnabled;
@@ -1534,6 +1548,132 @@ function startMeetingPlugServer(stClient) {
 }
 
 // ---------------------------------------------------------------------------
+// Govee outdoor lights
+// ---------------------------------------------------------------------------
+
+const GOVEE_STATE_FILE = resolve(__dirname, ".govee-lights-state.json");
+
+let goveeClient = null;
+let goveeDevice = null;
+// { onDate, offDate, scene }: which of tonight's edges already fired, and the
+// scene last shown so a holiday doesn't repeat itself two nights running.
+// Persisted so a restart mid-evening neither re-picks the scene nor fights an
+// off you did by hand in the Govee app.
+let goveeState = {};
+let goveeTickTimer = null;
+let goveeTickBusy = false;
+
+function loadGoveeState() {
+  if (!existsSync(GOVEE_STATE_FILE)) return {};
+  try {
+    return JSON.parse(readFileSync(GOVEE_STATE_FILE, "utf-8")) || {};
+  } catch (err) {
+    logError("Ignoring unreadable Govee state file", err);
+    return {};
+  }
+}
+
+function saveGoveeState() {
+  try {
+    writeFileSync(GOVEE_STATE_FILE, JSON.stringify(goveeState));
+  } catch (err) {
+    logError("Could not persist the Govee lights state", err);
+  }
+}
+
+// Tonight's switch-on time. SunCalc is asked about local noon so the answer is
+// this local day's sunset, not the UTC day's.
+function goveeOnAt(now) {
+  const noon = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 12);
+  const sunset = SunCalc.getTimes(noon, LATITUDE, LONGITUDE).sunset;
+  return new Date(sunset.getTime() + GOVEE_SUNSET_OFFSET_MINUTES * 60 * 1000);
+}
+
+// Exact name first, then substring, same as the meeting plug.
+async function resolveGoveeDevice() {
+  if (goveeDevice) return goveeDevice;
+  const devices = await goveeClient.listDevices();
+  const want = GOVEE_DEVICE_NAME.toLowerCase();
+  goveeDevice =
+    devices.find((d) => (d.deviceName || "").toLowerCase() === want) ||
+    devices.find((d) => (d.deviceName || "").toLowerCase().includes(want)) ||
+    null;
+  if (goveeDevice) {
+    log(`Govee lights: "${goveeDevice.deviceName}" (${goveeDevice.sku} ${goveeDevice.device})`);
+  } else {
+    logError(`No Govee device matching "${GOVEE_DEVICE_NAME}". Available: ${devices.map((d) => d.deviceName).join(", ")}`);
+  }
+  return goveeDevice;
+}
+
+async function goveeLightsOn(now) {
+  const scenes = await goveeClient.listScenes(goveeDevice);
+  const pick = pickScene({
+    now,
+    available: scenes.map((s) => s.name),
+    previous: goveeState.scene,
+    leadDays: GOVEE_HOLIDAY_LEAD_DAYS,
+    defaultScene: GOVEE_DEFAULT_SCENE,
+  });
+  const scene = scenes.find((s) => s.name === pick.scene);
+
+  await goveeClient.setPower(goveeDevice, true);
+  if (scene) {
+    await goveeClient.setScene(goveeDevice, scene.value);
+    const choice = pick.candidates.length > 1 ? ` (picked from ${pick.candidates.length}: ${pick.candidates.join(", ")})` : "";
+    log(`Govee lights on -- "${pick.scene}", ${pick.reason}${choice}`);
+  } else {
+    logError(`Govee lights on, but the device has no scene "${pick.scene}" -- left on its last scene`);
+  }
+  return pick.scene;
+}
+
+// Runs on a short interval against absolute times rather than as two long
+// setTimeouts, so a restart and a clock change both behave.
+async function goveeTick() {
+  if (goveeTickBusy) return;
+  const now = new Date();
+  const plan = planLights({ now, onAt: goveeOnAt(now), offAt: timeOnDay(now, GOVEE_OFF_TIME), state: goveeState });
+  if (plan.action === "idle") return;
+
+  goveeTickBusy = true;
+  try {
+    if (!(await resolveGoveeDevice())) return;
+    const today = localDateKey(now);
+    if (plan.action === "on") {
+      const scene = await goveeLightsOn(now);
+      goveeState = { ...goveeState, onDate: today, scene };
+    } else {
+      await goveeClient.setPower(goveeDevice, false);
+      log("Govee lights off");
+      goveeState = { ...goveeState, offDate: today };
+    }
+    saveGoveeState();
+  } catch (err) {
+    // Not recorded as done, so the next tick tries again.
+    logError(`Govee lights ${plan.action} failed -- retrying on the next tick`, err);
+  } finally {
+    goveeTickBusy = false;
+  }
+}
+
+function startGoveeLights() {
+  goveeClient = createGoveeClient({ apiKey: GOVEE_API_KEY });
+  goveeState = loadGoveeState();
+  log(`  Govee lights: next on ${goveeOnAt(new Date()).toLocaleString()} (sunset${GOVEE_SUNSET_OFFSET_MINUTES ? ` ${GOVEE_SUNSET_OFFSET_MINUTES >= 0 ? "+" : ""}${GOVEE_SUNSET_OFFSET_MINUTES}min` : ""})`);
+
+  resolveGoveeDevice().catch((err) =>
+    logError("Could not look up the Govee lights now -- will retry at the next on/off", err)
+  );
+
+  goveeTickTimer = setInterval(() => {
+    goveeTick().catch((err) => logError("Govee lights tick failed", err));
+  }, GOVEE_TICK_MS);
+  goveeTickTimer.unref();
+  goveeTick().catch((err) => logError("Govee lights catch-up tick failed", err));
+}
+
+// ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
 
@@ -1567,6 +1707,23 @@ async function main() {
   }
   if (meetingPlugServerEnabled && MEETING_PLUG_TOKENS.length > 1) {
     log(`  Meeting plug: ${MEETING_PLUG_TOKENS.length} client tokens accepted`);
+  }
+
+  // Before the Ring connection on purpose: the lights don't need Ring, and a
+  // slow alarm-hub handshake shouldn't hold up an on that's already due.
+  if (goveeLightsEnabled) {
+    try {
+      timeOnDay(new Date(), GOVEE_OFF_TIME); // fail fast on a malformed GOVEE_OFF_TIME
+      log(
+        `  Govee lights: "${GOVEE_DEVICE_NAME}" | on at sunset, off at ${GOVEE_OFF_TIME} | ` +
+          `default scene "${GOVEE_DEFAULT_SCENE}", holiday scenes ${GOVEE_HOLIDAY_LEAD_DAYS} days ahead`
+      );
+      startGoveeLights();
+    } catch (err) {
+      logError("Govee lights disabled this run", err);
+    }
+  } else {
+    log("  Govee lights disabled (missing GOVEE_API_KEY / LATITUDE / LONGITUDE)");
   }
 
   const ringApi = new RingApi({
@@ -1715,6 +1872,7 @@ function shutdown(signal) {
   log(`Shutting down (${signal})...`);
   if (healthCheckTimer) clearInterval(healthCheckTimer);
   if (meetingTickTimer) clearInterval(meetingTickTimer);
+  if (goveeTickTimer) clearInterval(goveeTickTimer);
   // The session file is left in place on purpose: it is how a restart knows a
   // meeting is still running and the plug is still owed an off.
   try { meetingServer?.close(); } catch (_) {}
