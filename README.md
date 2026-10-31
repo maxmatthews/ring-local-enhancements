@@ -707,6 +707,11 @@ are gitignored and exist only where they're used. Never put real secrets in `.en
 
 - **Unofficial Ring API**: `ring-client-api` is community-maintained. Ring can
   break it any time with backend changes.
+- **push-receiver override**: `package.json` `overrides` forces
+  `@eneris/push-receiver` 4.4.0 under `ring-client-api`, which pins 4.3.0.
+  4.3.0 misparses Ring's `crypto-key` header when it carries more than `dh=`
+  and logs `ERR_CRYPTO_ECDH_INVALID_PUBLIC_KEY` for every such push. Drop the
+  override once `ring-client-api` ships 4.4.0 or later itself.
 - **Snooze survives a restart as "off"**: the re-enable is an in-memory timer.
   If the service restarts inside a snooze window, that camera's Person
   notifications stay disabled until a later snooze cycle completes. Re-enable
