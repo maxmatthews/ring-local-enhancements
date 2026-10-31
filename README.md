@@ -517,6 +517,12 @@ ssh pi@pi.local 'pm2 logs ring-local-enhancements'
 `journalctl --vacuum-time=14d` maintenance job, not an app process, so it
 doesn't fit the pm2 model.
 
+pm2's own logs (`~/.pm2/logs`) are capped by the `pm2-logrotate` module,
+installed once into the pi daemon rather than by the deploy, so it covers every
+app on the Pi. It rotates each log at 10M or midnight, gzips, and keeps 14 — the
+same window as the journal. Inspect or change it with `pm2 conf pm2-logrotate`
+and `pm2 set pm2-logrotate:<key> <value>`.
+
 ## Configuration
 
 ### .env
