@@ -56,6 +56,12 @@ and the wait restarts on the next close. If the delay would fire after sunrise,
 the close is abandoned instead (no blind drops in the morning because a door
 was open all night).
 
+**Date holds:** `BLIND_HOLDS` in `blind-holds.mjs` lists blinds that stay
+open on a given calendar day every year — currently Living Room Center and
+Living Room Right on 10/31 (Halloween). On that day they're left out of the
+sunset close entirely (so no deferral or retry either), and level-sync won't
+drive them to the house level. A command you send yourself still moves them.
+
 **Sunset retry:** after the close sequence, the service re-lists the blinds
 `5min` later and re-sends the close to any that aren't at level 100 — up to
 2 passes.
@@ -680,6 +686,8 @@ for more than ~30 days, re-run `npm run pair-smartthings`.
 | `hub-discovery.mjs` | mDNS lookup of the Dirigera hub, preferring IPv4 (`discoverDirigeraHost`) |
 | `level-sync.mjs` | Pure decision logic for the level-sync retry (`planLevelSync`) |
 | `test-level-sync.mjs` | Unit tests for the above (`npm test`) |
+| `blind-holds.mjs` | Calendar days on which specific blinds skip the sunset close (`holdOpenReason`) |
+| `test-blind-holds.mjs` | Unit tests for the above (`npm test`) |
 | `diag-level-sync.mjs` | Live read-only diagnostic (`npm run diag`) |
 | `smartthings-lock.mjs` | SmartThings OAuth2 client: lock/unlock, switch on/off, list devices |
 | `meeting-plug.mjs` | Pure decision logic for the meeting plug (`planMeetingStart`, `planTick`) |

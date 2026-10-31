@@ -19,6 +19,7 @@ import { createSmartThingsClient } from "./smartthings-lock.mjs";
 import { planMeetingStart, planTick } from "./meeting-plug.mjs";
 import { discoverDirigeraHost } from "./hub-discovery.mjs";
 import { planLevelSync } from "./level-sync.mjs";
+import { holdOpenReason } from "./blind-holds.mjs";
 import SunCalc from "suncalc";
 import { createServer } from "http";
 import { timingSafeEqual } from "crypto";
@@ -602,6 +603,11 @@ async function onSunset(sensors) {
 
   for (const blind of blinds) {
     const blindName = blind.attributes?.customName || blind.id;
+    const held = holdOpenReason(blindName, new Date());
+    if (held) {
+      log(`"${blindName}": held open for ${held}, not closing tonight`);
+      continue;
+    }
     const sensorKeys = findSensorKeysForBlind(blindName);
 
     if (!sensorKeys) {
@@ -705,6 +711,7 @@ function levelSyncConfig() {
     fullOpenNudgeLevel: FULL_OPEN_NUDGE_LEVEL,
     isPendingClose: (id) => pendingCloses.has(id),
     openSensorsFor: openSensorsForBlind,
+    holdOpenReason: (name) => holdOpenReason(name, new Date()),
   };
 }
 
@@ -715,6 +722,8 @@ function stillEligible(straggler, burst, consensus) {
     return `deliberately set to ${burstTarget}`;
   }
   if (pendingCloses.has(straggler.id)) return "deferred sunset close pending";
+  const held = holdOpenReason(straggler.name, new Date());
+  if (held) return `held open for ${held}`;
   const open = openSensorsForBlind(straggler.name);
   if (open.length > 0) return `open sensor(s): ${open.join(", ")}`;
   return null;

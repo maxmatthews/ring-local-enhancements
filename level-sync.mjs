@@ -36,6 +36,7 @@ export function planLevelSync(blinds, burst, cfg) {
     fullOpenNudgeLevel,
     isPendingClose = () => false,
     openSensorsFor = () => [],
+    holdOpenReason = () => null,
   } = cfg;
 
   const ignore = (reason, extra = {}) => ({ action: "ignore", reason, ...extra });
@@ -101,6 +102,11 @@ export function planLevelSync(blinds, burst, cfg) {
     }
     if (isPendingClose(blind.id)) {
       skipped.push({ name, reason: "deferred sunset close pending" });
+      continue;
+    }
+    const held = holdOpenReason(name);
+    if (held) {
+      skipped.push({ name, reason: `held open for ${held}` });
       continue;
     }
     const open = openSensorsFor(name);

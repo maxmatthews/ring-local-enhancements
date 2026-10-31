@@ -19,6 +19,7 @@
 import { createDirigeraClient } from "dirigera";
 import { discoverDirigeraHost } from "./hub-discovery.mjs";
 import { planLevelSync, blindDisplayName } from "./level-sync.mjs";
+import { holdOpenReason } from "./blind-holds.mjs";
 import { readFileSync, existsSync } from "fs";
 import { resolve, dirname } from "path";
 import { fileURLToPath } from "url";
@@ -49,6 +50,7 @@ const cfg = {
   minBurst: parseInt(process.env.BLIND_LEVEL_SYNC_MIN_BURST || "3", 10),
   fullOpenNudgeEnabled: (process.env.BLIND_FULL_OPEN_NUDGE || "true").toLowerCase() !== "false",
   fullOpenNudgeLevel: parseInt(process.env.BLIND_FULL_OPEN_NUDGE_LEVEL || "3", 10),
+  holdOpenReason: (name) => holdOpenReason(name, new Date()),
 };
 
 const pad = (s, n) => String(s).padEnd(n);

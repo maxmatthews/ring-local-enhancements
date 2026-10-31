@@ -159,6 +159,17 @@ test("blind with a pending deferred close is left to the sunset logic", () => {
   assert.equal(plan.stragglers.length, 0);
 });
 
+test("blind held open for a date is left alone even when the house closes", () => {
+  const blinds = NAMES.map((n) => (n === "Living Room Right" ? blind(n, 0) : blind(n, 100)));
+  const plan = planLevelSync(blinds, burstOf(NAMES, 100), {
+    ...DEFAULTS,
+    holdOpenReason: (name) => (name === "Living Room Right" ? "Halloween" : null),
+  });
+
+  assert.ok(plan.skipped.some((s) => s.name === "Living Room Right" && /held open for Halloween/.test(s.reason)));
+  assert.equal(plan.stragglers.length, 0);
+});
+
 test("unreachable blinds are excluded from consensus and never commanded", () => {
   const blinds = NAMES.map((n) =>
     n === "Primary Bathroom" ? blind(n, 100, 100, { isReachable: false }) : blind(n, 40)
