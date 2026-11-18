@@ -46,6 +46,8 @@ EXCLUDES=(
   --exclude blind-sensor-map.json
   --exclude .meeting-plug-state.json
   --exclude .govee-lights-state.json
+  --exclude .thermostat-state.json
+  --exclude .thermostat-history.jsonl
   --exclude .DS_Store
   --exclude scratchpad
 )

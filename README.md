@@ -11,6 +11,7 @@ Local-network glue for a Ring + IKEA Dirigera home. One Node service
 | 4 | **Level-sync retry** — re-send a house-wide blind level to the blinds that missed it, plus a full-open nudge | Ring + Dirigera | `BLIND_LEVEL_SYNC_ENABLED=false` |
 | 5 | **Meeting-triggered smart plug** — switch a SmartThings plug on when MeetingBar joins a meeting, off when the meeting is scheduled to end | Ring + SmartThings + a Mac | omit `MEETING_PLUG_TOKEN` |
 | 6 | **Govee outdoor lights** — permanent outdoor lights on at sunset and off at 23:15, with a random holiday scene in the run-up to a holiday | Govee + `LATITUDE` / `LONGITUDE` | omit `GOVEE_API_KEY` |
+| 7 | **Heat pump preheat + away mode** — heat the house to 64°F just before the 07:00 end of off-peak power, starting as late as the learned warm-up rate allows; hold ~48°F while away; local dashboard with Leviton breaker readings | LG ThinQ (+ `LATITUDE` / `LONGITUDE` for outdoor temps) | omit `THINQ_PAT` |
 
 Each feature degrades independently: missing config disables just that
 feature and logs why at startup, and a setup failure (Dirigera unreachable,
@@ -360,6 +361,114 @@ is retried every `GOVEE_TICK_MS`.
 This uses the Govee cloud API (`govee.mjs`), so it needs internet access, not
 the LAN. Get a key in the Govee Home app: Profile → Settings → Apply for API
 Key, then set `GOVEE_API_KEY` in the Pi's `.env`.
+
+## 7. Heat pump preheat and away mode
+
+The "Central Air" unit is a ducted LG heat pump on the ThinQ cloud API
+(`thinq.mjs`). It reports as an air conditioner: power, mode
+(HEAT/COOL/AUTO/FAN/AIR_DRY), a heat setpoint of 60–86°F in whole degrees, and
+the indoor temperature in whole degrees.
+
+### Overnight preheat (VTOU)
+
+Power is cheap from `THERMOSTAT_OFFPEAK_START` (23:00) to
+`THERMOSTAT_OFFPEAK_END` (07:00). The goal is to reach
+`THERMOSTAT_PREHEAT_TARGET_F` (64°F) just before 07:00. Starting hours early
+wastes heat leaking out of a warm house, and finishing late spills heating into
+peak hours.
+
+Every `THERMOSTAT_TICK_MS` (5 min) inside the window the service works the start
+time back from 07:00:
+
+    minutes = (target − indoor) / rate × SAFETY + MARGIN
+
+`rate` is the predicted warm-up in °F/hour at the forecast outdoor temperature
+for the rest of the night. When now passes the start time it powers the unit
+on, sets HEAT, and sets the setpoint to 64°F, in that order, because the unit
+rejects mode and setpoint writes while off. It never starts before 23:00, even
+when 23:00 is too late to make 64°F by 07:00. Until the first warm-up run has
+been learned it also starts no later than `THERMOSTAT_PREHEAT_LATEST_START`
+(03:00, the hand-run routine). After that the model alone decides, earlier or
+later.
+
+- **Once per night.** The start is recorded in `.thermostat-state.json`. Change
+  the thermostat by hand after it starts and your change sticks.
+- **Skipped** when the house is already at 64°F, or the unit is already heating
+  to 64°F or higher.
+- **After 07:00** the unit is left as it is. Nothing switches it off yet.
+- `THERMOSTAT_PREHEAT_ENABLED=false` turns the preheat off (e.g. for summer).
+
+### Learning the warm-up rate
+
+Every tick appends a sample (indoor, setpoint, power, mode, outdoor °F) to
+`.thermostat-history.jsonl` on the Pi. Any stretch where the unit heated toward
+a setpoint for at least 30 minutes and needed at least 2°F counts as a warm-up
+run, including runs you started by hand. Its rate is filed against the outdoor
+temperature during the run.
+
+| Runs learned | Model |
+| --- | --- |
+| none | Prior: `THERMOSTAT_DEFAULT_RATE_F_PER_HOUR` (1.0) at 35°F outside, 0.03°F/h slower for each °F colder |
+| a few, or all at similar outdoor temps | Their duration-weighted mean, shifted along that same 0.03 slope to tonight's temperature |
+| 4+ spread over 8°F+ of outdoor temps | Least-squares line, rate vs outdoor temperature |
+
+Rates are clamped to 0.25–8°F/h. The prior is deliberately slow, so the first
+cold nights start early rather than late. Outdoor temperatures come from
+[Open-Meteo](https://open-meteo.com) (no key) at `LATITUDE` / `LONGITUDE`,
+rounded to two decimals.
+
+### Away mode
+
+The unit's lowest heat setpoint is 60°F, so 48°F can't be set. Away mode
+switches it instead: heat (toward 60°F) when the house falls to
+`THERMOSTAT_AWAY_TEMP_F − THERMOSTAT_AWAY_BAND_F` (47°F), off once it is back to
+`+ BAND` (49°F). Anything else running when away mode starts is switched off.
+The overnight preheat is suspended while away. Coming home restores the power,
+mode and setpoint the unit had when away mode started.
+
+Away mode is switched over the same listener as the meeting plug, with the same
+`MEETING_PLUG_TOKEN`s:
+
+| Method | Path | Purpose |
+| --- | --- | --- |
+| `POST` | `/thermostat/away` | Away mode on |
+| `POST` | `/thermostat/home` | Away mode off; restores the previous setting |
+| `GET` | `/thermostat/status` | Away state, last reading, outdoor/forecast temps, predicted rate and model, recent learned runs |
+
+```sh
+curl -X POST -H "Authorization: Bearer $TOKEN" http://pi.local:8787/thermostat/away
+```
+
+### Dashboard
+
+`http://pi.local:8787/dashboard` (also `/`) on the home network. The page asks
+once for a `MEETING_PLUG_TOKEN` and keeps it in that browser. It shows:
+
+- indoor and outdoor temperature, what the unit is doing, and the heat pump's
+  draw from the Leviton breaker
+- tonight's plan: when the preheat is expected to start, and the model behind it
+- temperatures over 1–14 days, with heating runs and off-peak hours shaded
+- the heat pump's kWh per hour, split into off-peak and peak hours, with
+  Leviton's cost estimate
+- every learned warm-up run
+- an Away / I'm home switch
+
+It refreshes every minute. The page holds no data and is served without a
+token. Everything else comes from `GET /thermostat/status` and
+`GET /thermostat/history?hours=N`, both behind the token.
+
+**Leviton is read-only.** `leviton.mjs` signs in with `LEVITON_EMAIL` /
+`LEVITON_PASSWORD` and only reads; it never writes to the panel or switches a
+breaker. LG's ThinQ API is the only control path. Leviton has no local API, so
+this goes through Leviton's cloud API (my.leviton.com). The breaker's live
+watts are only as fresh as the panel's last report, often an hour old. The
+panel only reports quickly while the My Leviton app holds it in fast mode, and
+setting that takes a write. The dashboard shows how old the reading is. Hourly
+kWh comes from Leviton's per-day history and is reliable.
+
+Away mode survives restarts (`.thermostat-state.json`). It depends on the Pi
+and the ThinQ cloud being up. If either is down, nothing switches the heat back
+on.
 
 ## How it works
 
@@ -721,7 +830,7 @@ for more than ~30 days, re-run `npm run pair-smartthings`.
 
 | File | Role |
 | --- | --- |
-| `index.mjs` | The service: all six automations, config, lifecycle |
+| `index.mjs` | The service: all seven automations, config, lifecycle |
 | `hub-discovery.mjs` | mDNS lookup of the Dirigera hub, preferring IPv4 (`discoverDirigeraHost`) |
 | `level-sync.mjs` | Pure decision logic for the level-sync retry (`planLevelSync`) |
 | `test-level-sync.mjs` | Unit tests for the above (`npm test`) |
@@ -734,6 +843,12 @@ for more than ~30 days, re-run `npm run pair-smartthings`.
 | `govee.mjs` | Govee cloud API client: devices, scenes, power, set scene |
 | `govee-lights.mjs` | Pure schedule + holiday calendar for the outdoor lights (`pickScene`, `planLights`) |
 | `test-govee-lights.mjs` | Unit tests for the above (`npm test`) |
+| `thinq.mjs` | LG ThinQ Connect API client: devices, state, control; air-conditioner helpers |
+| `thermostat.mjs` | Pure preheat/away logic and the warm-up learner (`planThermostat`, `extractWarmups`, `fitWarmupModel`) |
+| `weather.mjs` | Open-Meteo outdoor temperature + hourly forecast |
+| `leviton.mjs` | Leviton cloud API, read-only: breakers and hourly energy, for the dashboard |
+| `dashboard.html` | The heat pump dashboard, served at `/dashboard` |
+| `test-thermostat.mjs` | Unit tests for the thermostat logic (`npm test`) |
 | `mac/` | The Mac half of feature 5: MeetingBar join script, helper, installer |
 | `pair-smartthings.mjs` | One-time SmartThings OAuth pairing helper |
 | `deploy.sh` | rsync + test + pm2 restart deploy to the Pi |
@@ -742,8 +857,9 @@ for more than ~30 days, re-run `npm run pair-smartthings`.
 | `update-node.cron` | Reference copy of `/etc/cron.weekly/update-node` on the Pi — weekly Node upgrade + pm2 migration |
 | `.env.example`, `blind-sensor-map.json.example` | Tracked templates |
 
-`.env`, `.env.pi.bak`, `blind-sensor-map.json`, `.meeting-plug-state.json` and
-`.govee-lights-state.json` are gitignored and exist only where they're used. Never put real secrets in `.env.example`.
+`.env`, `.env.pi.bak`, `blind-sensor-map.json`, `.meeting-plug-state.json`,
+`.govee-lights-state.json`, `.thermostat-state.json` and
+`.thermostat-history.jsonl` are gitignored and exist only where they're used. Never put real secrets in `.env.example`.
 
 ## Caveats
 

@@ -9,6 +9,9 @@
  *      Blinds with no mapping always close.
  *   3. Switches Govee permanent outdoor lights on at sunset and off at a fixed
  *      time, with a holiday scene in the run-up to a holiday (govee-lights.mjs).
+ *   4. Drives the LG ThinQ "Central Air" heat pump: preheats the house during
+ *      the off-peak VTOU window so it reaches its target just before the
+ *      window ends, and holds it near 48°F in away mode (thermostat.mjs).
  *
  * The Dirigera hub has no native Ring integration; the sunset trigger lives
  * here. Disable the equivalent scene in the IKEA Home Smart app so the two
@@ -24,10 +27,14 @@ import { planLevelSync } from "./level-sync.mjs";
 import { holdOpenReason } from "./blind-holds.mjs";
 import { createGoveeClient } from "./govee.mjs";
 import { pickScene, planLights, localDateKey, timeOnDay, DEFAULT_SCENE, DEFAULT_LEAD_DAYS } from "./govee-lights.mjs";
+import { createThinqClient, summarizeAcState, acCommands } from "./thinq.mjs";
+import { offPeakWindow, extractWarmups, fitWarmupModel, planThermostat, meanForecast, DEFAULTS as THERMOSTAT_DEFAULTS } from "./thermostat.mjs";
+import { fetchOutdoor } from "./weather.mjs";
+import { createLevitonClient, findBreaker } from "./leviton.mjs";
 import SunCalc from "suncalc";
 import { createServer } from "http";
-import { timingSafeEqual } from "crypto";
-import { readFileSync, writeFileSync, existsSync, unlinkSync } from "fs";
+import { timingSafeEqual, randomUUID } from "crypto";
+import { readFileSync, writeFileSync, appendFileSync, existsSync, unlinkSync } from "fs";
 import { resolve, dirname } from "path";
 import { fileURLToPath } from "url";
 
@@ -128,6 +135,36 @@ const GOVEE_OFF_TIME = process.env.GOVEE_OFF_TIME || "23:15";
 const GOVEE_SUNSET_OFFSET_MINUTES = parseInt(process.env.GOVEE_SUNSET_OFFSET_MINUTES || "0", 10);
 const GOVEE_HOLIDAY_LEAD_DAYS = parseInt(process.env.GOVEE_HOLIDAY_LEAD_DAYS || String(DEFAULT_LEAD_DAYS), 10);
 const GOVEE_TICK_MS = parseInt(process.env.GOVEE_TICK_MS || "60000", 10);
+// LG ThinQ "Central Air" (a ducted heat pump): overnight VTOU preheat and away
+// mode. See thermostat.mjs for the logic.
+const THINQ_PAT = process.env.THINQ_PAT;
+const THINQ_COUNTRY = process.env.THINQ_COUNTRY || "US";
+const THINQ_REGION = process.env.THINQ_REGION || "AIC";
+const THERMOSTAT_DEVICE_NAME = process.env.THERMOSTAT_DEVICE_NAME || "Central Air";
+const THERMOSTAT_PREHEAT_ENABLED = (process.env.THERMOSTAT_PREHEAT_ENABLED || "true").toLowerCase() !== "false";
+const num = (key, fallback) => {
+  const v = parseFloat(process.env[key] ?? "");
+  return Number.isFinite(v) ? v : fallback;
+};
+const THERMOSTAT_OPTS = {
+  targetF: num("THERMOSTAT_PREHEAT_TARGET_F", THERMOSTAT_DEFAULTS.targetF),
+  windowStart: process.env.THERMOSTAT_OFFPEAK_START || THERMOSTAT_DEFAULTS.windowStart,
+  windowEnd: process.env.THERMOSTAT_OFFPEAK_END || THERMOSTAT_DEFAULTS.windowEnd,
+  safety: num("THERMOSTAT_PREHEAT_SAFETY", THERMOSTAT_DEFAULTS.safety),
+  marginMinutes: num("THERMOSTAT_PREHEAT_MARGIN_MINUTES", THERMOSTAT_DEFAULTS.marginMinutes),
+  defaultRatePerHour: num("THERMOSTAT_DEFAULT_RATE_F_PER_HOUR", THERMOSTAT_DEFAULTS.defaultRatePerHour),
+  awayF: num("THERMOSTAT_AWAY_TEMP_F", THERMOSTAT_DEFAULTS.awayF),
+  awayBandF: num("THERMOSTAT_AWAY_BAND_F", THERMOSTAT_DEFAULTS.awayBandF),
+};
+const THERMOSTAT_TICK_MS = parseInt(process.env.THERMOSTAT_TICK_MS || "300000", 10);
+// Until a warm-up has been learned, start no later than this (the hand-run
+// routine that's known to work). Blank = no cap.
+const THERMOSTAT_PREHEAT_LATEST_START = process.env.THERMOSTAT_PREHEAT_LATEST_START ?? "03:00";
+// Leviton load center: the heat pump breaker's readings, for the dashboard
+// only. Read-only -- see leviton.mjs.
+const LEVITON_EMAIL = process.env.LEVITON_EMAIL;
+const LEVITON_PASSWORD = process.env.LEVITON_PASSWORD;
+const LEVITON_BREAKER_NAME = process.env.LEVITON_BREAKER_NAME || "Heat Pump";
 const SMOKE_UNLOCK_COOLDOWN_SECONDS = parseInt(process.env.SMOKE_UNLOCK_COOLDOWN_SECONDS || "300", 10);
 const BLIND_CLOSED_LEVEL = 100;
 const BLIND_CLOSE_SPACING_MS = 10 * 1000;
@@ -206,6 +243,13 @@ const smokeUnlockEnabled = !!(ST_CLIENT_ID && ST_CLIENT_SECRET && ST_REFRESH_TOK
 const meetingPlugServerEnabled = !!(ST_CLIENT_ID && ST_CLIENT_SECRET && ST_REFRESH_TOKEN && MEETING_PLUG_TOKENS.length);
 const meetingPlugConfigured = !!(meetingPlugServerEnabled && (MEETING_PLUG_DEVICE_ID || MEETING_PLUG_DEVICE_NAME));
 const goveeLightsEnabled = !!(GOVEE_API_KEY && Number.isFinite(LATITUDE) && Number.isFinite(LONGITUDE));
+// Outdoor temperature (LATITUDE / LONGITUDE) sharpens the warm-up prediction
+// but isn't required: without it the model just can't adjust for the weather.
+const thermostatEnabled = !!THINQ_PAT;
+const levitonEnabled = !!(thermostatEnabled && LEVITON_EMAIL && LEVITON_PASSWORD);
+// One listener serves the meeting plug and the thermostat's away switch, behind
+// the same bearer tokens. No tokens, no listener.
+const httpServerEnabled = MEETING_PLUG_TOKENS.length > 0 && (meetingPlugServerEnabled || thermostatEnabled);
 // One SmartThings client serves both features. Two would fight: refresh tokens
 // rotate on every use, so a second client would invalidate the first one's.
 const smartThingsEnabled = smokeUnlockEnabled || meetingPlugServerEnabled;
@@ -1225,7 +1269,7 @@ let meetingPlugDeviceId = MEETING_PLUG_DEVICE_ID || null;
 // { offAt: epoch ms, owned: bool, title: string } while a meeting is running.
 let meetingSession = null;
 let meetingStClient = null;
-let meetingServer = null;
+let httpServer = null;
 let meetingTickTimer = null;
 let meetingTickBusy = false;
 
@@ -1477,10 +1521,8 @@ async function handleMeetingEnd(res) {
   return sendJson(res, 200, { ok: true, active: false, switchedOff: true });
 }
 
-async function handleMeetingRequest(req, res) {
-  const path = new URL(req.url, "http://localhost").pathname.replace(/\/+$/, "") || "/";
-
-  if (!meetingAuthOk(req)) return sendJson(res, 401, { error: "unauthorized" });
+async function handleMeetingRequest(req, res, path) {
+  if (!meetingStClient) return sendJson(res, 503, { error: "meeting plug not configured (needs the ST_* credentials)" });
 
   if (req.method === "GET" && path === "/meeting/status") {
     return sendJson(res, 200, meetingStatusBody());
@@ -1528,23 +1570,38 @@ function startMeetingPlugServer(stClient) {
     logError("Could not look up the meeting plug now -- will retry on the first meeting", err)
   );
 
-  meetingServer = createServer((req, res) => {
-    handleMeetingRequest(req, res).catch((err) => {
-      logError("Meeting-plug request failed", err);
-      if (!res.headersSent) sendJson(res, 500, { error: "internal error" });
-    });
-  });
-  meetingServer.on("error", (err) => logError(`Meeting-plug listener on ${MEETING_PLUG_HOST}:${MEETING_PLUG_PORT} failed`, err));
-  meetingServer.listen(MEETING_PLUG_PORT, MEETING_PLUG_HOST, () => {
-    log(`  Meeting plug: listening on ${MEETING_PLUG_HOST}:${MEETING_PLUG_PORT}`);
-  });
-
   meetingTickTimer = setInterval(() => {
     meetingTick().catch((err) => logError("Meeting-plug tick failed", err));
   }, MEETING_PLUG_TICK_MS);
   meetingTickTimer.unref();
   // Catch up immediately in case the off time passed while we were down.
   meetingTick().catch((err) => logError("Meeting-plug catch-up tick failed", err));
+}
+
+// One listener for every HTTP-driven feature: /thermostat/* goes to the
+// thermostat, everything else to the meeting plug. Same tokens for both.
+// Started before the Ring connection so the away switch works even while the
+// alarm hub is slow to answer.
+function startHttpServer() {
+  httpServer = createServer((req, res) => {
+    const path = new URL(req.url, "http://localhost").pathname.replace(/\/+$/, "") || "/";
+    const handle = async () => {
+      // The page itself holds no data, so it's served without a token; it asks
+      // for one and sends it on every data request.
+      if (req.method === "GET" && (path === "/" || path === "/dashboard")) return serveDashboard(res);
+      if (!meetingAuthOk(req)) return sendJson(res, 401, { error: "unauthorized" });
+      if (path === "/thermostat" || path.startsWith("/thermostat/")) return handleThermostatRequest(req, res, path);
+      return handleMeetingRequest(req, res, path);
+    };
+    handle().catch((err) => {
+      logError(`HTTP ${req.method} ${path} failed`, err);
+      if (!res.headersSent) sendJson(res, 500, { error: "internal error" });
+    });
+  });
+  httpServer.on("error", (err) => logError(`HTTP listener on ${MEETING_PLUG_HOST}:${MEETING_PLUG_PORT} failed`, err));
+  httpServer.listen(MEETING_PLUG_PORT, MEETING_PLUG_HOST, () => {
+    log(`  HTTP: listening on ${MEETING_PLUG_HOST}:${MEETING_PLUG_PORT}`);
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -1674,6 +1731,398 @@ function startGoveeLights() {
 }
 
 // ---------------------------------------------------------------------------
+// LG ThinQ thermostat (Central Air heat pump)
+// ---------------------------------------------------------------------------
+
+// { preheatKey, away, awaySince, awaySnapshot, awayHeating } -- see thermostat.mjs.
+const THERMOSTAT_STATE_FILE = resolve(__dirname, ".thermostat-state.json");
+// One JSON sample per tick: what the warm-up model learns from. Append-only,
+// pruned to THERMOSTAT_HISTORY_DAYS at startup.
+const THERMOSTAT_HISTORY_FILE = resolve(__dirname, ".thermostat-history.jsonl");
+const THERMOSTAT_HISTORY_DAYS = 400; // a full heating season and then some
+const OUTDOOR_REFRESH_MS = 30 * 60 * 1000;
+const OUTDOOR_MAX_AGE_MS = 6 * 60 * 60 * 1000;
+const THINQ_COMMAND_SPACING_MS = 3000;
+
+let thinq = null;
+let thermostatDeviceId = null;
+let thermostatState = {};
+let thermostatHistory = [];
+let thermostatOutdoor = null;
+let thermostatLast = null; // the last tick's reading and plan, for GET /thermostat/status
+let thermostatAnnouncedKey = null;
+let thermostatTickTimer = null;
+let thermostatTickBusy = false;
+
+function loadThermostatState() {
+  if (!existsSync(THERMOSTAT_STATE_FILE)) return {};
+  try {
+    return JSON.parse(readFileSync(THERMOSTAT_STATE_FILE, "utf-8")) || {};
+  } catch (err) {
+    logError("Ignoring unreadable thermostat state file", err);
+    return {};
+  }
+}
+
+function saveThermostatState() {
+  try {
+    writeFileSync(THERMOSTAT_STATE_FILE, JSON.stringify(thermostatState));
+  } catch (err) {
+    logError("Could not persist the thermostat state", err);
+  }
+}
+
+function loadThermostatHistory() {
+  if (!existsSync(THERMOSTAT_HISTORY_FILE)) return [];
+  const cutoff = Date.now() - THERMOSTAT_HISTORY_DAYS * 24 * 60 * 60 * 1000;
+  const lines = readFileSync(THERMOSTAT_HISTORY_FILE, "utf-8").split("\n").filter(Boolean);
+  const samples = [];
+  for (const line of lines) {
+    try {
+      const s = JSON.parse(line);
+      if (s.t >= cutoff) samples.push(s);
+    } catch (_) {} // a torn last line from a crash mid-append
+  }
+  if (samples.length < lines.length) {
+    writeFileSync(THERMOSTAT_HISTORY_FILE, samples.map((s) => JSON.stringify(s)).join("\n") + (samples.length ? "\n" : ""));
+  }
+  return samples;
+}
+
+function recordThermostatSample(sample) {
+  thermostatHistory.push(sample);
+  try {
+    appendFileSync(THERMOSTAT_HISTORY_FILE, JSON.stringify(sample) + "\n");
+  } catch (err) {
+    logError("Could not append to the thermostat history", err);
+  }
+}
+
+// Cached; a failed refresh keeps the last forecast for a few hours.
+async function outdoorWeather() {
+  if (!Number.isFinite(LATITUDE) || !Number.isFinite(LONGITUDE)) return null;
+  const age = thermostatOutdoor ? Date.now() - thermostatOutdoor.fetchedAt : Infinity;
+  if (age > OUTDOOR_REFRESH_MS) {
+    try {
+      thermostatOutdoor = await fetchOutdoor({ latitude: LATITUDE, longitude: LONGITUDE });
+    } catch (err) {
+      logError("Outdoor temperature fetch failed -- using the last forecast if recent", err);
+    }
+  }
+  return thermostatOutdoor && Date.now() - thermostatOutdoor.fetchedAt <= OUTDOOR_MAX_AGE_MS ? thermostatOutdoor : null;
+}
+
+async function resolveThermostatDevice() {
+  if (thermostatDeviceId) return thermostatDeviceId;
+  const devices = (await thinq.listDevices()).filter((d) => d.deviceInfo?.deviceType === "DEVICE_AIR_CONDITIONER");
+  const want = THERMOSTAT_DEVICE_NAME.toLowerCase();
+  const alias = (d) => (d.deviceInfo.alias || "").toLowerCase();
+  const match = devices.find((d) => alias(d) === want) || devices.find((d) => alias(d).includes(want));
+  if (match) {
+    thermostatDeviceId = match.deviceId;
+    log(`Thermostat: "${match.deviceInfo.alias}" (${match.deviceInfo.modelName})`);
+  } else {
+    logError(`No ThinQ air conditioner matching "${THERMOSTAT_DEVICE_NAME}". Available: ${devices.map((d) => d.deviceInfo.alias).join(", ")}`);
+  }
+  return thermostatDeviceId;
+}
+
+const thinqPause = () => new Promise((r) => setTimeout(r, THINQ_COMMAND_SPACING_MS));
+
+// Power on, then mode, then setpoint -- the unit rejects the last two while
+// off. Each is skipped when already right. Pauses between commands give the
+// unit time to wake before the next write.
+async function thermostatHeatTo(device, targetF) {
+  if (!device.power) {
+    await thinq.control(thermostatDeviceId, acCommands.power(true));
+    await thinqPause();
+  }
+  if (device.mode !== "HEAT") {
+    await thinq.control(thermostatDeviceId, acCommands.mode("HEAT"));
+    await thinqPause();
+  }
+  if (device.targetF !== targetF) await thinq.control(thermostatDeviceId, acCommands.heatTargetF(targetF));
+}
+
+function thermostatModel() {
+  return fitWarmupModel(extractWarmups(thermostatHistory), THERMOSTAT_OPTS);
+}
+
+async function thermostatTick() {
+  refreshLevitonLive().catch((err) => logError("Leviton refresh failed", err));
+  if (thermostatTickBusy) return;
+  thermostatTickBusy = true;
+  try {
+    if (!(await resolveThermostatDevice())) return;
+    const now = new Date();
+    const device = summarizeAcState(await thinq.getState(thermostatDeviceId));
+    const outdoor = await outdoorWeather();
+    recordThermostatSample({ t: now.getTime(), ...device, outdoorF: outdoor?.nowF ?? null, away: !!thermostatState.away });
+
+    const window = offPeakWindow(now, THERMOSTAT_OPTS.windowStart, THERMOSTAT_OPTS.windowEnd);
+    // What matters is the weather while it's heating: the forecast over what's left of the window.
+    const forecastF = outdoor ? meanForecast(outdoor.hourly, now > window.start ? now : window.start, window.end) : null;
+    const model = thermostatModel();
+    const ratePerHour = model.rateAt(forecastF ?? outdoor?.nowF ?? null);
+    const state = THERMOSTAT_PREHEAT_ENABLED || thermostatState.away ? thermostatState : { ...thermostatState, preheatKey: window.key };
+    const latestStart = model.kind === "default" && THERMOSTAT_PREHEAT_LATEST_START ? THERMOSTAT_PREHEAT_LATEST_START : null;
+    const plan = planThermostat({ now, device, state, ratePerHour, opts: { ...THERMOSTAT_OPTS, latestStart } });
+    thermostatLast = { at: now.toISOString(), device, outdoorF: outdoor?.nowF ?? null, forecastF, ratePerHour, model: model.describe, plan };
+
+    if (plan.startAt && thermostatAnnouncedKey !== plan.key) {
+      thermostatAnnouncedKey = plan.key;
+      log(
+        `Thermostat: preheat to ${THERMOSTAT_OPTS.targetF}°F expected ~${plan.startAt.toLocaleTimeString()} ` +
+          `(${device.indoorF}°F inside, ${forecastF?.toFixed(0) ?? "?"}°F forecast, ${ratePerHour.toFixed(2)}°F/h -- ${model.describe}` +
+          `${latestStart ? `; no later than ${latestStart} until a warm-up is learned` : ""})`
+      );
+    }
+
+    switch (plan.action) {
+      case "preheat":
+        await thermostatHeatTo(device, THERMOSTAT_OPTS.targetF);
+        thermostatState = { ...thermostatState, preheatKey: plan.key };
+        log(`Thermostat: preheat started -- ${plan.reason} (needs ~${Math.round(plan.minutesNeeded)}min at ${ratePerHour.toFixed(2)}°F/h)`);
+        break;
+      case "preheat-skip":
+        thermostatState = { ...thermostatState, preheatKey: plan.key };
+        log(`Thermostat: preheat not needed -- ${plan.reason}`);
+        break;
+      case "away-heat-on":
+        // Heat toward the unit's floor; we switch it off long before it gets there.
+        await thermostatHeatTo(device, device.minTargetF ?? 60);
+        thermostatState = { ...thermostatState, awayHeating: true };
+        log(`Thermostat: ${plan.reason} -- heating`);
+        break;
+      case "away-heat-off":
+        await thinq.control(thermostatDeviceId, acCommands.power(false));
+        thermostatState = { ...thermostatState, awayHeating: false };
+        log(`Thermostat: ${plan.reason} -- off`);
+        break;
+      default:
+        return;
+    }
+    saveThermostatState();
+  } catch (err) {
+    // Nothing recorded as done, so the next tick tries again.
+    logError("Thermostat tick failed -- retrying on the next tick", err);
+  } finally {
+    thermostatTickBusy = false;
+  }
+}
+
+function runThermostatTickSoon() {
+  setTimeout(() => thermostatTick().catch((err) => logError("Thermostat tick failed", err)), 0);
+}
+
+async function setThermostatAway(away) {
+  if (!(await resolveThermostatDevice())) throw new Error(`no thermostat matching "${THERMOSTAT_DEVICE_NAME}"`);
+  if (!!thermostatState.away === away) return { changed: false };
+  const device = summarizeAcState(await thinq.getState(thermostatDeviceId));
+
+  if (away) {
+    // Remember how it was so coming home can put it back.
+    thermostatState = {
+      ...thermostatState,
+      away: true,
+      awaySince: new Date().toISOString(),
+      awaySnapshot: { power: device.power, mode: device.mode, targetF: device.targetF },
+      awayHeating: false,
+    };
+    saveThermostatState();
+    log(`Thermostat: away mode on -- holding ~${THERMOSTAT_OPTS.awayF}°F (was ${device.power ? `${device.mode} ${device.targetF}°F` : "off"})`);
+    runThermostatTickSoon(); // switches off whatever is running, or starts heat if already cold
+    return { changed: true, device };
+  }
+
+  const snap = thermostatState.awaySnapshot;
+  thermostatState = { ...thermostatState, away: false, awaySince: null, awaySnapshot: null, awayHeating: false };
+  saveThermostatState();
+  try {
+    if (snap?.power) {
+      if (snap.mode === "HEAT") await thermostatHeatTo(device, snap.targetF);
+      else {
+        if (!device.power) {
+          await thinq.control(thermostatDeviceId, acCommands.power(true));
+          await thinqPause();
+        }
+        if (snap.mode && device.mode !== snap.mode) await thinq.control(thermostatDeviceId, acCommands.mode(snap.mode));
+      }
+    } else if (device.power) {
+      await thinq.control(thermostatDeviceId, acCommands.power(false));
+    }
+    log(`Thermostat: away mode off -- restored ${snap?.power ? `${snap.mode} ${snap.targetF}°F` : "off"}`);
+  } catch (err) {
+    logError("Thermostat: away mode off, but restoring the previous setting failed -- set it by hand", err);
+    return { changed: true, restored: false };
+  }
+  runThermostatTickSoon();
+  return { changed: true, restored: true };
+}
+
+// --- Leviton heat pump breaker (dashboard only) ------------------------------
+
+const LEVITON_LIVE_REFRESH_MS = 5 * 60 * 1000;
+const LEVITON_TODAY_REFRESH_MS = 30 * 60 * 1000;
+const LEVITON_MAX_DAYS = 14;
+const LOCAL_TZ = Intl.DateTimeFormat().resolvedOptions().timeZone;
+
+let leviton = null;
+let levitonBreaker = null; // normalizeBreaker() of the heat pump, plus fetchedAt
+let levitonBreakerPosition = null;
+let levitonLiveAt = 0;
+const levitonDays = new Map(); // "YYYY-MM-DD" -> { rows, fetchedAt }
+
+async function refreshLevitonLive() {
+  if (!leviton || Date.now() - levitonLiveAt < LEVITON_LIVE_REFRESH_MS) return;
+  levitonLiveAt = Date.now();
+  try {
+    const breakers = await leviton.listBreakers();
+    const b = findBreaker(breakers, LEVITON_BREAKER_NAME);
+    if (!b) {
+      logError(`No Leviton breaker matching "${LEVITON_BREAKER_NAME}". Available: ${breakers.map((x) => x.name).join(", ")}`);
+      return;
+    }
+    if (levitonBreakerPosition == null) log(`Leviton: heat pump breaker "${b.name}" (position ${b.position}, ${b.poles}-pole)`);
+    levitonBreakerPosition = b.position;
+    levitonBreaker = { ...b, fetchedAt: new Date().toISOString() };
+  } catch (err) {
+    logError("Leviton breaker read failed", err);
+  }
+}
+
+// Hourly kWh for the heat pump on one local day. Past days are final and kept;
+// today is refetched every half hour.
+async function levitonDay(day) {
+  const cached = levitonDays.get(day);
+  const isToday = day === localDateKey(new Date());
+  if (cached && (!isToday || Date.now() - cached.fetchedAt < LEVITON_TODAY_REFRESH_MS)) return cached.rows;
+  if (levitonBreakerPosition == null) await refreshLevitonLive();
+  if (levitonBreakerPosition == null) return cached?.rows ?? [];
+  const all = await leviton.hourlyEnergy(day, LOCAL_TZ);
+  const rows = all[String(levitonBreakerPosition)] || [];
+  levitonDays.set(day, { rows, fetchedAt: Date.now() });
+  for (const key of levitonDays.keys()) if (levitonDays.size > LEVITON_MAX_DAYS + 2 && key < day) levitonDays.delete(key);
+  return rows;
+}
+
+async function heatPumpEnergy(fromMs, toMs) {
+  if (!leviton) return [];
+  const days = [];
+  for (let d = new Date(fromMs); d <= new Date(toMs); d = new Date(d.getFullYear(), d.getMonth(), d.getDate() + 1)) {
+    days.push(localDateKey(d));
+  }
+  const out = [];
+  for (const day of days) {
+    try {
+      out.push(...(await levitonDay(day)));
+    } catch (err) {
+      logError(`Leviton energy for ${day} failed`, err);
+    }
+  }
+  return out;
+}
+
+/** Every Nth sample, so a long range stays a few thousand points. */
+function downsample(samples, max = 2000) {
+  if (samples.length <= max) return samples;
+  const step = Math.ceil(samples.length / max);
+  return samples.filter((_, i) => i % step === 0 || i === samples.length - 1);
+}
+
+async function thermostatHistoryBody(hours) {
+  const toMs = Date.now();
+  const fromMs = toMs - hours * 60 * 60 * 1000;
+  const samples = thermostatHistory.filter((s) => s.t >= fromMs);
+  return {
+    from: new Date(fromMs).toISOString(),
+    to: new Date(toMs).toISOString(),
+    samples: downsample(samples),
+    energy: await heatPumpEnergy(fromMs, toMs),
+    breaker: levitonBreaker,
+    levitonEnabled,
+  };
+}
+
+function serveDashboard(res) {
+  try {
+    const html = readFileSync(resolve(__dirname, "dashboard.html"));
+    res.writeHead(200, {
+      "Content-Type": "text/html; charset=utf-8",
+      "Content-Length": html.length,
+      "Cache-Control": "no-cache",
+      // Everything is inline; nothing is fetched from anywhere but here.
+      "Content-Security-Policy": "default-src 'self'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src 'self' data:",
+    });
+    res.end(html);
+  } catch (err) {
+    logError("Dashboard page missing", err);
+    sendJson(res, 500, { error: "dashboard.html missing" });
+  }
+}
+
+function thermostatStatusBody() {
+  return {
+    away: !!thermostatState.away,
+    awaySince: thermostatState.awaySince ?? null,
+    awayHeating: !!thermostatState.awayHeating,
+    preheatEnabled: THERMOSTAT_PREHEAT_ENABLED,
+    lastPreheat: thermostatState.preheatKey ?? null,
+    settings: { ...THERMOSTAT_OPTS, latestStart: THERMOSTAT_PREHEAT_LATEST_START || null },
+    last: thermostatLast,
+    learnedRuns: extractWarmups(thermostatHistory).slice(-20),
+    samples: thermostatHistory.length,
+    breaker: levitonBreaker,
+    window: (() => {
+      const w = offPeakWindow(new Date(), THERMOSTAT_OPTS.windowStart, THERMOSTAT_OPTS.windowEnd);
+      return { start: w.start.toISOString(), end: w.end.toISOString(), inWindow: w.inWindow };
+    })(),
+  };
+}
+
+async function handleThermostatRequest(req, res, path) {
+  if (!thermostatEnabled) return sendJson(res, 503, { error: "thermostat not configured (needs THINQ_PAT)" });
+  if (req.method === "GET" && path === "/thermostat/status") return sendJson(res, 200, thermostatStatusBody());
+  if (req.method === "GET" && path === "/thermostat/history") {
+    const hours = Math.min(LEVITON_MAX_DAYS * 24, Math.max(1, parseInt(new URL(req.url, "http://localhost").searchParams.get("hours") || "48", 10) || 48));
+    return sendJson(res, 200, await thermostatHistoryBody(hours));
+  }
+  if (req.method === "POST" && (path === "/thermostat/away" || path === "/thermostat/home")) {
+    const result = await setThermostatAway(path === "/thermostat/away");
+    return sendJson(res, 200, { ok: true, ...result, away: !!thermostatState.away });
+  }
+  return sendJson(res, 404, { error: "not found" });
+}
+
+function startThermostat() {
+  let clientId = process.env.THINQ_CLIENT_ID;
+  if (!clientId) {
+    // Any id works, but it should stay the same for this installation.
+    clientId = `ring-local-enhancements-${randomUUID()}`;
+    persistEnvVar("THINQ_CLIENT_ID", clientId);
+    log("  Thermostat: generated THINQ_CLIENT_ID and saved it to .env");
+  }
+  thinq = createThinqClient({ token: THINQ_PAT, clientId, country: THINQ_COUNTRY, region: THINQ_REGION });
+  if (levitonEnabled) {
+    leviton = createLevitonClient({ email: LEVITON_EMAIL, password: LEVITON_PASSWORD });
+    log(`  Leviton: reading breaker "${LEVITON_BREAKER_NAME}" for the dashboard (read-only)`);
+  } else {
+    log("  Leviton disabled (missing LEVITON_EMAIL / LEVITON_PASSWORD)");
+  }
+  thermostatState = loadThermostatState();
+  thermostatHistory = loadThermostatHistory();
+  const model = thermostatModel();
+  log(`  Thermostat: ${thermostatHistory.length} samples, warm-up model: ${model.describe}`);
+  if (thermostatState.away) log(`  Thermostat: in away mode since ${thermostatState.awaySince}`);
+
+  thermostatTickTimer = setInterval(() => {
+    thermostatTick().catch((err) => logError("Thermostat tick failed", err));
+  }, THERMOSTAT_TICK_MS);
+  thermostatTickTimer.unref();
+  thermostatTick().catch((err) => logError("Thermostat catch-up tick failed", err));
+}
+
+// ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
 
@@ -1725,6 +2174,25 @@ async function main() {
   } else {
     log("  Govee lights disabled (missing GOVEE_API_KEY / LATITUDE / LONGITUDE)");
   }
+
+  if (thermostatEnabled) {
+    try {
+      offPeakWindow(new Date(), THERMOSTAT_OPTS.windowStart, THERMOSTAT_OPTS.windowEnd); // fail fast on malformed times
+      if (THERMOSTAT_PREHEAT_LATEST_START) offPeakWindow(new Date(), THERMOSTAT_PREHEAT_LATEST_START, THERMOSTAT_OPTS.windowEnd);
+      log(
+        `  Thermostat: "${THERMOSTAT_DEVICE_NAME}" | preheat ${THERMOSTAT_PREHEAT_ENABLED ? `to ${THERMOSTAT_OPTS.targetF}°F by ${THERMOSTAT_OPTS.windowEnd} ` +
+          `(off-peak from ${THERMOSTAT_OPTS.windowStart})` : "off"} | away holds ~${THERMOSTAT_OPTS.awayF}°F | ` +
+          `outdoor temps ${Number.isFinite(LATITUDE) && Number.isFinite(LONGITUDE) ? "on" : "off (no LATITUDE / LONGITUDE)"}`
+      );
+      startThermostat();
+    } catch (err) {
+      logError("Thermostat disabled this run", err);
+    }
+  } else {
+    log("  Thermostat disabled (missing THINQ_PAT)");
+  }
+  if (httpServerEnabled) startHttpServer();
+  else if (thermostatEnabled) log("  Thermostat: no MEETING_PLUG_TOKEN set -- the away switch (HTTP) is unavailable");
 
   const ringApi = new RingApi({
     refreshToken: REFRESH_TOKEN,
@@ -1873,9 +2341,10 @@ function shutdown(signal) {
   if (healthCheckTimer) clearInterval(healthCheckTimer);
   if (meetingTickTimer) clearInterval(meetingTickTimer);
   if (goveeTickTimer) clearInterval(goveeTickTimer);
+  if (thermostatTickTimer) clearInterval(thermostatTickTimer);
   // The session file is left in place on purpose: it is how a restart knows a
   // meeting is still running and the plug is still owed an off.
-  try { meetingServer?.close(); } catch (_) {}
+  try { httpServer?.close(); } catch (_) {}
   try { dirigera?.stopListeningForUpdates(); } catch (_) {}
   process.exit(0);
 }

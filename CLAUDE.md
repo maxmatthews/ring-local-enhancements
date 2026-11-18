@@ -2,9 +2,9 @@
 
 ## Checks
 
-- `npm test` — unit tests for the level-sync, meeting-plug, blind-hold and
-  Govee-lights decision logic (`level-sync.mjs`, `meeting-plug.mjs`,
-  `blind-holds.mjs`, `govee-lights.mjs`). Pure and offline; run
+- `npm test` — unit tests for the level-sync, meeting-plug, blind-hold,
+  Govee-lights and thermostat decision logic (`level-sync.mjs`,
+  `meeting-plug.mjs`, `blind-holds.mjs`, `govee-lights.mjs`, `thermostat.mjs`). Pure and offline; run
   before deploying.
 - `npm run diag` — read-only report of live blind levels and what the
   level-sync logic would decide. Needs LAN access to the Dirigera hub, so
@@ -27,6 +27,12 @@
   mid-meeting would strand the plug on.
 - `.govee-lights-state.json` is likewise the Pi's own (which of tonight's
   on/off already fired, and the last scene shown) and excluded from the deploy.
+- `.thermostat-state.json` (preheat done tonight, away mode + the setting to
+  restore) and `.thermostat-history.jsonl` (the samples the warm-up model
+  learns from) are the Pi's own too and excluded from the deploy. Losing the
+  history resets the learning.
+- The Leviton breaker integration (`leviton.mjs`) is read-only by decision:
+  dashboard display only, never a write to the panel or a breaker switch.
 - Managed by pm2 (`ecosystem.config.cjs`), running under the pi user's pm2
   daemon (`pm2-pi.service`), consistent with the other projects on this Pi.
 - `journal-cleaner` stays on its systemd timer — it's a system-level

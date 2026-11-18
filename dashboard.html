@@ -1,0 +1,608 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Heat Pump Dashboard</title>
+<style>
+  :root {
+    color-scheme: light;
+    --bg: #f4f3ef;
+    --surface: #fcfcfb;
+    --border: #e3e1da;
+    --grid: #ebe9e3;
+    --text: #0b0b0b;
+    --text-2: #52514e;
+    --text-3: #7d7c77;
+    --series-1: #2a78d6; /* indoor */
+    --series-2: #eb6834; /* outdoor */
+    --setpoint: #52514e;
+    --heat-band: rgba(235, 104, 52, 0.12);
+    --offpeak-band: rgba(42, 120, 214, 0.07);
+    --bar: #2a78d6;
+    --bar-peak: #eb6834;
+    --good: #0ca30c;
+    --warn: #fab219;
+    --critical: #d03b3b;
+    --btn: #0b0b0b;
+    --btn-text: #fcfcfb;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      color-scheme: dark;
+      --bg: #121211;
+      --surface: #1a1a19;
+      --border: #2e2e2b;
+      --grid: #262624;
+      --text: #f0efec;
+      --text-2: #c3c2b7;
+      --text-3: #8e8d86;
+      --series-1: #3987e5;
+      --series-2: #d95926;
+      --setpoint: #c3c2b7;
+      --heat-band: rgba(217, 89, 38, 0.16);
+      --offpeak-band: rgba(57, 135, 229, 0.10);
+      --bar: #3987e5;
+      --bar-peak: #d95926;
+      --btn: #f0efec;
+      --btn-text: #1a1a19;
+    }
+  }
+  :root[data-theme="dark"] {
+    color-scheme: dark;
+    --bg: #121211; --surface: #1a1a19; --border: #2e2e2b; --grid: #262624;
+    --text: #f0efec; --text-2: #c3c2b7; --text-3: #8e8d86;
+    --series-1: #3987e5; --series-2: #d95926; --setpoint: #c3c2b7;
+    --heat-band: rgba(217, 89, 38, 0.16); --offpeak-band: rgba(57, 135, 229, 0.10);
+    --bar: #3987e5; --bar-peak: #d95926; --btn: #f0efec; --btn-text: #1a1a19;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 15px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  }
+  main { max-width: 1080px; margin: 0 auto; padding: 20px 16px 48px; }
+  header { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin-bottom: 16px; }
+  h1 { font-size: 20px; margin: 0; font-weight: 650; }
+  h2 { font-size: 14px; margin: 0 0 10px; font-weight: 600; color: var(--text-2); text-transform: uppercase; letter-spacing: .04em; }
+  .muted { color: var(--text-3); font-size: 13px; }
+  .spacer { flex: 1; }
+  button, select {
+    font: inherit; font-size: 14px; border-radius: 8px; border: 1px solid var(--border);
+    background: var(--surface); color: var(--text); padding: 6px 12px; cursor: pointer;
+  }
+  button.primary { background: var(--btn); color: var(--btn-text); border-color: var(--btn); }
+  button:disabled { opacity: .5; cursor: default; }
+  .card { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 16px; margin-bottom: 16px; }
+  .tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; margin-bottom: 16px; }
+  .tile { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 14px 16px; }
+  .tile .label { font-size: 13px; color: var(--text-2); }
+  .tile .value { font-size: 30px; font-weight: 650; font-variant-numeric: tabular-nums; margin: 2px 0; }
+  .tile .sub { font-size: 13px; color: var(--text-3); }
+  .status { display: inline-flex; align-items: center; gap: 6px; font-size: 13px; }
+  .dot { width: 9px; height: 9px; border-radius: 50%; display: inline-block; }
+  .plan { font-size: 17px; font-weight: 600; }
+  .row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+  .legend { display: flex; gap: 16px; flex-wrap: wrap; font-size: 13px; color: var(--text-2); margin: 0 0 6px; }
+  .legend span { display: inline-flex; align-items: center; gap: 6px; }
+  .key-line { width: 16px; height: 0; border-top: 2px solid; display: inline-block; }
+  .key-dash { border-top-style: dashed; }
+  .key-box { width: 12px; height: 12px; border-radius: 3px; display: inline-block; }
+  .chart { position: relative; }
+  .chart svg { display: block; width: 100%; overflow: visible; }
+  .tip {
+    position: absolute; pointer-events: none; background: var(--surface); border: 1px solid var(--border);
+    border-radius: 8px; padding: 8px 10px; font-size: 13px; box-shadow: 0 4px 16px rgba(0,0,0,.12);
+    white-space: nowrap; display: none; z-index: 2;
+  }
+  .tip .t { color: var(--text-3); margin-bottom: 4px; }
+  .tip .r { display: flex; align-items: center; gap: 8px; }
+  .tip strong { font-variant-numeric: tabular-nums; }
+  table { width: 100%; border-collapse: collapse; font-size: 14px; font-variant-numeric: tabular-nums; }
+  th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--grid); }
+  th { color: var(--text-2); font-weight: 600; font-size: 13px; }
+  details summary { cursor: pointer; color: var(--text-2); font-size: 13px; margin-top: 8px; }
+  .scroll { overflow-x: auto; max-height: 320px; overflow-y: auto; }
+  .gate { max-width: 420px; margin: 12vh auto; }
+  .gate input { width: 100%; font: inherit; padding: 8px 10px; border-radius: 8px; border: 1px solid var(--border); background: var(--bg); color: var(--text); margin: 8px 0 12px; }
+  .err { color: var(--critical); font-size: 13px; }
+  .totals { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; margin-top: 12px; }
+  .totals div { font-size: 13px; color: var(--text-2); }
+  .totals strong { display: block; font-size: 20px; color: var(--text); font-variant-numeric: tabular-nums; }
+  @media (max-width: 520px) { .tile .value { font-size: 26px; } }
+</style>
+</head>
+<body>
+<main id="app"></main>
+
+<script>
+"use strict";
+// Served by the Pi. Data comes from /thermostat/* with the same bearer token as
+// the meeting plug; the token is kept in this browser only.
+const TOKEN_KEY = "heatpump-dashboard-token";
+const RANGE_KEY = "heatpump-dashboard-range";
+const REFRESH_MS = 60 * 1000;
+const app = document.getElementById("app");
+
+const store = {
+  get(k) { try { return localStorage.getItem(k); } catch { return null; } },
+  set(k, v) { try { localStorage.setItem(k, v); } catch {} },
+  del(k) { try { localStorage.removeItem(k); } catch {} },
+};
+
+let token = store.get(TOKEN_KEY);
+let rangeHours = parseInt(store.get(RANGE_KEY) || "48", 10);
+let status = null, history = null, lastError = null, timer = null;
+
+// --- tiny DOM helpers (all text via textContent) ---------------------------
+function el(tag, attrs = {}, ...kids) {
+  const n = document.createElement(tag);
+  for (const [k, v] of Object.entries(attrs)) {
+    if (k === "class") n.className = v;
+    else if (k === "style") n.style.cssText = v;
+    else if (k.startsWith("on")) n.addEventListener(k.slice(2), v);
+    else n.setAttribute(k, v);
+  }
+  for (const kid of kids.flat()) if (kid != null && kid !== false) n.append(kid instanceof Node ? kid : document.createTextNode(String(kid)));
+  return n;
+}
+const SVGNS = "http://www.w3.org/2000/svg";
+function s(tag, attrs = {}) {
+  const n = document.createElementNS(SVGNS, tag);
+  for (const [k, v] of Object.entries(attrs)) n.setAttribute(k, v);
+  return n;
+}
+const fmtTime = (d) => d.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+const fmtDay = (d) => d.toLocaleDateString([], { weekday: "short", month: "short", day: "numeric" });
+const fmtWhen = (d) => `${fmtDay(d)} ${fmtTime(d)}`;
+const deg = (v) => (v == null || !Number.isFinite(v) ? "–" : `${Math.round(v)}°`);
+
+// --- data ------------------------------------------------------------------
+async function api(path, opts = {}) {
+  const res = await fetch(path, { ...opts, headers: { Authorization: `Bearer ${token}`, ...(opts.headers || {}) } });
+  if (res.status === 401) { store.del(TOKEN_KEY); token = null; throw new Error("unauthorized"); }
+  const json = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(json.error || `HTTP ${res.status}`);
+  return json;
+}
+
+async function load() {
+  try {
+    [status, history] = await Promise.all([api("/thermostat/status"), api(`/thermostat/history?hours=${rangeHours}`)]);
+    lastError = null;
+  } catch (err) {
+    lastError = err.message;
+  }
+  render();
+}
+
+function schedule() {
+  clearInterval(timer);
+  timer = setInterval(load, REFRESH_MS);
+}
+
+// --- token gate --------------------------------------------------------------
+function renderGate(msg) {
+  const input = el("input", { type: "password", placeholder: "MEETING_PLUG_TOKEN", autocomplete: "current-password" });
+  const form = el("form", { class: "card gate", onsubmit: (e) => {
+      e.preventDefault();
+      token = input.value.trim();
+      if (!token) return;
+      store.set(TOKEN_KEY, token);
+      app.replaceChildren(el("p", { class: "muted" }, "Loading…"));
+      load().then(schedule);
+    } },
+    el("h1", {}, "Heat pump"),
+    el("p", { class: "muted" }, "Paste one of the Pi's MEETING_PLUG_TOKEN values. It's kept in this browser only."),
+    input,
+    msg ? el("p", { class: "err" }, msg) : null,
+    el("button", { class: "primary", type: "submit" }, "Open dashboard"));
+  app.replaceChildren(form);
+  input.focus();
+}
+
+// --- main render -------------------------------------------------------------
+function render() {
+  if (!token) return renderGate(lastError === "unauthorized" ? "That token was rejected." : null);
+  if (!status) {
+    app.replaceChildren(el("p", { class: "err" }, `Couldn't load: ${lastError || "unknown error"}`));
+    return;
+  }
+  const last = status.last;
+  const dev = last?.device;
+  const settings = status.settings;
+
+  const header = el("header", {},
+    el("h1", {}, "Heat pump"),
+    el("span", { class: "muted" }, last ? `Updated ${fmtTime(new Date(last.at))}` : "No reading yet"),
+    lastError ? el("span", { class: "err" }, `Refresh failed: ${lastError}`) : null,
+    el("span", { class: "spacer" }),
+    rangePicker(),
+    awayButton());
+
+  const tiles = el("div", { class: "tiles" },
+    tile("Indoor", deg(dev?.indoorF), dev ? `Setpoint ${deg(dev.targetF)}` : ""),
+    tile("Outdoor", deg(last?.outdoorF), last?.forecastF != null ? `Rest of tonight ~${deg(last.forecastF)}` : "No forecast"),
+    unitTile(dev),
+    breakerTile(status.breaker));
+
+  app.replaceChildren(header, tiles, planCard(), tempCard(), energyCard(), runsCard());
+}
+
+function tile(label, value, sub, extra) {
+  return el("div", { class: "tile" }, el("div", { class: "label" }, label), el("div", { class: "value" }, value), extra || null, el("div", { class: "sub" }, sub));
+}
+
+function statusPill(color, text) {
+  return el("span", { class: "status" }, el("span", { class: "dot", style: `background:${color}` }), text);
+}
+
+function unitTile(dev) {
+  if (status.away) {
+    return tile("Unit", "Away", `Holding ~${status.settings.awayF}° since ${fmtWhen(new Date(status.awaySince))}`,
+      statusPill(status.awayHeating ? "var(--series-2)" : "var(--text-3)", status.awayHeating ? "Heating" : "Off"));
+  }
+  if (!dev) return tile("Unit", "–", "");
+  const on = dev.power;
+  const mode = dev.mode ? dev.mode[0] + dev.mode.slice(1).toLowerCase() : "";
+  return tile("Unit", on ? mode : "Off", on ? `to ${deg(dev.targetF)}` : `${mode} mode, ${deg(dev.targetF)} when on`,
+    on ? statusPill("var(--good)", "Running") : null);
+}
+
+function breakerTile(b) {
+  if (!b) return tile("Heat pump draw", "–", history?.levitonEnabled === false ? "Leviton not configured" : "No breaker reading yet");
+  const at = b.lastUpdated ? new Date(b.lastUpdated) : null;
+  const ageMin = at ? Math.round((Date.now() - at) / 60000) : null;
+  const kw = b.watts == null ? "–" : `${(b.watts / 1000).toFixed(b.watts >= 10000 ? 0 : 1)} kW`;
+  const stale = ageMin != null && ageMin > 15;
+  return tile("Heat pump draw", kw,
+    `${b.amps ?? "–"} A · ${at ? `as of ${fmtTime(at)}` : "time unknown"}`,
+    stale ? statusPill("var(--warn)", `Panel reading is ${ageMin} min old`) : null);
+}
+
+function planCard() {
+  const last = status.last;
+  const plan = last?.plan;
+  const s = status.settings;
+  let headline, detail = [];
+  if (status.away) {
+    headline = `Away: holding ~${s.awayF}° (heat below ${s.awayF - s.awayBandF}°, off above ${s.awayF + s.awayBandF}°)`;
+    detail.push("The overnight preheat is paused while away.");
+  } else if (!status.preheatEnabled) {
+    headline = "Overnight preheat is turned off";
+  } else if (plan?.startAt) {
+    const start = new Date(plan.startAt);
+    headline = `Preheat to ${s.targetF}° expected at ${fmtTime(start)}, done by ${s.windowEnd}`;
+    detail.push(`Needs ~${Math.round(plan.minutesNeeded)} min at ${last.ratePerHour.toFixed(2)}°F/h.`);
+  } else if (plan) {
+    headline = plan.reason[0].toUpperCase() + plan.reason.slice(1);
+  } else {
+    headline = "Waiting for the first reading";
+  }
+  if (status.lastPreheat) detail.push(`Last preheat handled for the morning of ${status.lastPreheat}.`);
+  if (last?.model) detail.push(`Warm-up model: ${last.model}.`);
+  detail.push(`Off-peak ${s.windowStart}–${s.windowEnd}. ${status.samples} samples logged.`);
+  return el("div", { class: "card" }, el("h2", {}, "Tonight"), el("div", { class: "plan" }, headline), el("p", { class: "muted", style: "margin:6px 0 0" }, detail.join(" ")));
+}
+
+function rangePicker() {
+  const sel = el("select", { "aria-label": "Time range", onchange: (e) => {
+      rangeHours = parseInt(e.target.value, 10);
+      store.set(RANGE_KEY, String(rangeHours));
+      load();
+    } });
+  for (const [h, label] of [[24, "Last 24 hours"], [48, "Last 2 days"], [168, "Last 7 days"], [336, "Last 14 days"]]) {
+    const o = el("option", { value: String(h) }, label);
+    if (h === rangeHours) o.selected = true;
+    sel.append(o);
+  }
+  return sel;
+}
+
+function awayButton() {
+  const away = status.away;
+  return el("button", { class: away ? "primary" : "", onclick: async (e) => {
+      const msg = away
+        ? "Turn away mode off? The unit goes back to how it was when you left."
+        : `Turn away mode on? The unit switches off and holds the house near ${status.settings.awayF}°.`;
+      if (!confirm(msg)) return;
+      e.target.disabled = true;
+      try { await api(away ? "/thermostat/home" : "/thermostat/away", { method: "POST" }); }
+      catch (err) { alert(`Failed: ${err.message}`); }
+      setTimeout(load, 1500);
+    } }, away ? "I'm home" : "Away mode");
+}
+
+// --- shared chart geometry ---------------------------------------------------
+const M = { top: 10, right: 12, bottom: 26, left: 40 };
+
+function chartFrame(height) {
+  const box = el("div", { class: "chart" });
+  const tip = el("div", { class: "tip" });
+  box.append(tip);
+  const width = Math.max(300, app.clientWidth - 34);
+  const svg = s("svg", { viewBox: `0 0 ${width} ${height}`, height, role: "img" });
+  box.prepend(svg);
+  return { box, tip, svg, width, height, iw: width - M.left - M.right, ih: height - M.top - M.bottom };
+}
+
+function rangeBounds() {
+  return { from: +new Date(history.from), to: +new Date(history.to) };
+}
+
+/** Off-peak windows overlapping [from, to], as [start, end] ms pairs. */
+function offPeakSpans(from, to) {
+  const [sh, sm] = status.settings.windowStart.split(":").map(Number);
+  const [eh, em] = status.settings.windowEnd.split(":").map(Number);
+  const spans = [];
+  const d0 = new Date(from); d0.setDate(d0.getDate() - 1);
+  for (let d = new Date(d0.getFullYear(), d0.getMonth(), d0.getDate()); +d <= to; d.setDate(d.getDate() + 1)) {
+    const start = new Date(d.getFullYear(), d.getMonth(), d.getDate(), sh, sm);
+    let end = new Date(d.getFullYear(), d.getMonth(), d.getDate(), eh, em);
+    if (end <= start) end = new Date(end.getFullYear(), end.getMonth(), end.getDate() + 1, eh, em);
+    if (+end > from && +start < to) spans.push([Math.max(+start, from), Math.min(+end, to)]);
+  }
+  return spans;
+}
+
+function timeAxis(g, x, from, to, ih) {
+  // Pick the tick step from the pixels available, so labels never collide on a phone.
+  const hours = (to - from) / 3600000;
+  const pxPerHour = x(to) / hours;
+  const stepH = [3, 6, 12, 24, 48, 96].find((h) => h * pxPerHour >= 80) || 168;
+  const first = new Date(from); first.setMinutes(0, 0, 0);
+  while (first.getHours() % Math.min(stepH, 24) !== 0) first.setHours(first.getHours() + 1);
+  for (let t = +first; t <= to; t += stepH * 3600000) {
+    const d = new Date(t);
+    const label = stepH >= 24 || d.getHours() === 0 ? fmtDay(d) : d.toLocaleTimeString([], { hour: "numeric" });
+    const tx = x(t);
+    g.append(s("line", { x1: tx, x2: tx, y1: ih, y2: ih + 4, stroke: "var(--border)" }));
+    const txt = s("text", { x: tx, y: ih + 18, "text-anchor": "middle", "font-size": 11, fill: "var(--text-3)" });
+    txt.textContent = label;
+    g.append(txt);
+  }
+}
+
+function setTip(tip, ...rows) { tip.replaceChildren(...rows.filter(Boolean)); }
+
+function placeTip(tip, box, px, py) {
+  tip.style.display = "block";
+  const bw = box.clientWidth, tw = tip.offsetWidth;
+  tip.style.left = `${Math.min(Math.max(0, px + 14), bw - tw)}px`;
+  tip.style.top = `${Math.max(0, py - 10)}px`;
+}
+
+// --- temperature chart ---------------------------------------------------------
+function tempCard() {
+  const card = el("div", { class: "card" }, el("h2", {}, "Temperatures (°F)"));
+  const samples = history?.samples || [];
+  card.append(el("div", { class: "legend" },
+    el("span", {}, el("span", { class: "key-line", style: "border-color:var(--series-1)" }), "Indoor"),
+    el("span", {}, el("span", { class: "key-line", style: "border-color:var(--series-2)" }), "Outdoor"),
+    el("span", {}, el("span", { class: "key-line key-dash", style: "border-color:var(--setpoint)" }), "Setpoint (when on)"),
+    el("span", {}, el("span", { class: "key-box", style: "background:var(--heat-band)" }), "Heating"),
+    el("span", {}, el("span", { class: "key-box", style: "background:var(--offpeak-band)" }), "Off-peak")));
+  if (!samples.length) {
+    card.append(el("p", { class: "muted" }, "No readings yet. The service logs one every 5 minutes."));
+    return card;
+  }
+
+  const { from, to } = rangeBounds();
+  const f = chartFrame(260);
+  const vals = samples.flatMap((d) => [d.indoorF, d.outdoorF, d.power && d.mode === "HEAT" ? d.targetF : null]).filter(Number.isFinite);
+  let lo = Math.floor((Math.min(...vals) - 2) / 5) * 5, hi = Math.ceil((Math.max(...vals) + 2) / 5) * 5;
+  if (hi - lo < 10) hi = lo + 10;
+  const x = (t) => ((t - from) / (to - from)) * f.iw;
+  const y = (v) => f.ih - ((v - lo) / (hi - lo)) * f.ih;
+  const g = s("g", { transform: `translate(${M.left},${M.top})` });
+  f.svg.append(g);
+
+  for (const [a, b] of offPeakSpans(from, to)) g.append(s("rect", { x: x(a), y: 0, width: x(b) - x(a), height: f.ih, fill: "var(--offpeak-band)" }));
+  // Heating bands: consecutive samples with the unit on in HEAT.
+  let bandStart = null;
+  samples.forEach((d, i) => {
+    const heating = d.power && d.mode === "HEAT";
+    const next = samples[i + 1];
+    if (heating && bandStart == null) bandStart = d.t;
+    if (bandStart != null && (!next || !(next.power && next.mode === "HEAT") || next.t - d.t > 20 * 60000)) {
+      const end = next && next.t - d.t <= 20 * 60000 ? next.t : d.t + 5 * 60000;
+      g.append(s("rect", { x: x(bandStart), y: 0, width: Math.max(1, x(end) - x(bandStart)), height: f.ih, fill: "var(--heat-band)" }));
+      bandStart = null;
+    }
+  });
+
+  const step = (hi - lo) / 5 >= 5 ? 10 : 5;
+  for (let v = lo; v <= hi; v += step) {
+    g.append(s("line", { x1: 0, x2: f.iw, y1: y(v), y2: y(v), stroke: "var(--grid)" }));
+    const t = s("text", { x: -8, y: y(v) + 4, "text-anchor": "end", "font-size": 11, fill: "var(--text-3)" });
+    t.textContent = `${v}°`;
+    g.append(t);
+  }
+  timeAxis(g, x, from, to, f.ih);
+
+  const line = (key, color, dash, only) => {
+    let dpath = "", prev = null;
+    for (const d of samples) {
+      const v = only && !only(d) ? null : d[key];
+      if (!Number.isFinite(v)) { prev = null; continue; }
+      const gap = prev && d.t - prev.t > 20 * 60000;
+      dpath += `${!prev || gap ? "M" : "L"}${x(d.t).toFixed(1)},${y(v).toFixed(1)}`;
+      prev = d;
+    }
+    g.append(s("path", { d: dpath, fill: "none", stroke: color, "stroke-width": 2, "stroke-linejoin": "round", ...(dash ? { "stroke-dasharray": "5 4" } : {}) }));
+  };
+  line("targetF", "var(--setpoint)", true, (d) => d.power && d.mode === "HEAT");
+  line("outdoorF", "var(--series-2)");
+  line("indoorF", "var(--series-1)");
+
+  // Crosshair + one tooltip listing every series at the nearest sample.
+  const hair = s("line", { y1: 0, y2: f.ih, stroke: "var(--text-3)", "stroke-width": 1, visibility: "hidden" });
+  const dotIn = s("circle", { r: 4, fill: "var(--series-1)", stroke: "var(--surface)", "stroke-width": 2, visibility: "hidden" });
+  const dotOut = s("circle", { r: 4, fill: "var(--series-2)", stroke: "var(--surface)", "stroke-width": 2, visibility: "hidden" });
+  g.append(hair, dotOut, dotIn);
+  const hit = s("rect", { x: 0, y: 0, width: f.iw, height: f.ih, fill: "transparent" });
+  g.append(hit);
+  const show = (evt) => {
+    const r = f.svg.getBoundingClientRect();
+    const px = ((evt.clientX - r.left) / r.width) * f.width - M.left;
+    const t = from + (px / f.iw) * (to - from);
+    let best = samples[0];
+    for (const d of samples) if (Math.abs(d.t - t) < Math.abs(best.t - t)) best = d;
+    const bx = x(best.t);
+    hair.setAttribute("x1", bx); hair.setAttribute("x2", bx); hair.setAttribute("visibility", "visible");
+    for (const [dot, key] of [[dotIn, "indoorF"], [dotOut, "outdoorF"]]) {
+      if (Number.isFinite(best[key])) { dot.setAttribute("cx", bx); dot.setAttribute("cy", y(best[key])); dot.setAttribute("visibility", "visible"); }
+      else dot.setAttribute("visibility", "hidden");
+    }
+    const row = (color, value, label, dash) => el("div", { class: "r" },
+      el("span", { class: `key-line${dash ? " key-dash" : ""}`, style: `border-color:${color}` }), el("strong", {}, value), el("span", { class: "muted" }, label));
+    setTip(f.tip,
+      el("div", { class: "t" }, fmtWhen(new Date(best.t))),
+      row("var(--series-1)", deg(best.indoorF), "Indoor"),
+      row("var(--series-2)", deg(best.outdoorF), "Outdoor"),
+      row("var(--setpoint)", best.power ? `${best.mode?.toLowerCase()} ${deg(best.targetF)}` : "off", "Unit", true),
+      best.away ? el("div", { class: "muted" }, "Away mode") : null);
+    placeTip(f.tip, f.box, ((bx + M.left) / f.width) * r.width, ((evt.clientY - r.top)));
+  };
+  const hide = () => { f.tip.style.display = "none"; for (const n of [hair, dotIn, dotOut]) n.setAttribute("visibility", "hidden"); };
+  hit.addEventListener("pointermove", show);
+  hit.addEventListener("pointerdown", show);
+  hit.addEventListener("pointerleave", hide);
+  card.append(f.box);
+
+  // Table view.
+  const rows = samples.slice().reverse().map((d) => el("tr", {},
+    el("td", {}, fmtWhen(new Date(d.t))), el("td", {}, deg(d.indoorF)), el("td", {}, deg(d.outdoorF)),
+    el("td", {}, d.power ? `${d.mode} ${deg(d.targetF)}` : "Off"), el("td", {}, d.away ? "Yes" : "")));
+  card.append(el("details", {}, el("summary", {}, "Show readings as a table"),
+    el("div", { class: "scroll" }, el("table", {}, el("thead", {}, el("tr", {}, ...["Time", "Indoor", "Outdoor", "Unit", "Away"].map((h) => el("th", {}, h)))), el("tbody", {}, rows)))));
+  return card;
+}
+
+// --- energy chart ----------------------------------------------------------------
+function hourStart(row) {
+  const [d, hm] = row.hour.split(" ");
+  const [Y, Mo, D] = d.split("-").map(Number);
+  return +new Date(Y, Mo - 1, D, Number(hm.slice(0, 2)));
+}
+
+function inOffPeak(t) {
+  return offPeakSpans(t - 86400000, t + 86400000).some(([a, b]) => t >= a && t < b);
+}
+
+function energyCard() {
+  const card = el("div", { class: "card" }, el("h2", {}, "Heat pump energy per hour (kWh)"));
+  if (history?.levitonEnabled === false) {
+    card.append(el("p", { class: "muted" }, "Leviton isn't configured (LEVITON_EMAIL / LEVITON_PASSWORD on the Pi)."));
+    return card;
+  }
+  const { from, to } = rangeBounds();
+  const now = Date.now();
+  const rows = (history?.energy || []).map((r) => ({ ...r, t: hourStart(r) })).filter((r) => r.t + 3600000 > from && r.t <= now);
+  if (!rows.length) {
+    card.append(el("p", { class: "muted" }, "No energy data from the Leviton panel yet."));
+    return card;
+  }
+  card.append(el("div", { class: "legend" },
+    el("span", {}, el("span", { class: "key-box", style: "background:var(--bar)" }), "Off-peak hour"),
+    el("span", {}, el("span", { class: "key-box", style: "background:var(--bar-peak)" }), "Peak hour")));
+
+  const f = chartFrame(180);
+  const max = Math.max(0.2, ...rows.map((r) => r.kWh));
+  const tick = [0.05, 0.1, 0.25, 0.5, 1, 2, 2.5, 5, 10].find((t) => t * 4 >= max) || Math.ceil(max / 4);
+  const top = tick * 4;
+  const x = (t) => ((t - from) / (to - from)) * f.iw;
+  const y = (v) => f.ih - (v / top) * f.ih;
+  const g = s("g", { transform: `translate(${M.left},${M.top})` });
+  f.svg.append(g);
+  for (const [a, b] of offPeakSpans(from, to)) g.append(s("rect", { x: x(a), y: 0, width: x(b) - x(a), height: f.ih, fill: "var(--offpeak-band)" }));
+  for (let i = 0; i <= 4; i++) {
+    const v = (top / 4) * i;
+    g.append(s("line", { x1: 0, x2: f.iw, y1: y(v), y2: y(v), stroke: "var(--grid)" }));
+    const t = s("text", { x: -8, y: y(v) + 4, "text-anchor": "end", "font-size": 11, fill: "var(--text-3)" });
+    t.textContent = String(+v.toFixed(2));
+    g.append(t);
+  }
+  timeAxis(g, x, from, to, f.ih);
+
+  const slot = (3600000 / (to - from)) * f.iw;
+  const bw = Math.max(1, slot - 2); // 2px surface gap between adjacent bars
+  for (const r of rows) {
+    if (r.kWh <= 0) continue;
+    const bx = Math.max(0, x(r.t) + 1), h = f.ih - y(r.kWh);
+    const off = inOffPeak(r.t);
+    const rx = Math.min(4, bw / 2, h);
+    // Rounded top, square base on the baseline.
+    const path = `M${bx},${f.ih}V${f.ih - h + rx}Q${bx},${f.ih - h} ${bx + rx},${f.ih - h}H${bx + bw - rx}Q${bx + bw},${f.ih - h} ${bx + bw},${f.ih - h + rx}V${f.ih}Z`;
+    const bar = s("path", { d: path, fill: off ? "var(--bar)" : "var(--bar-peak)", tabindex: 0 });
+    const hitR = s("rect", { x: x(r.t), y: 0, width: Math.max(slot, 6), height: f.ih, fill: "transparent" });
+    const show = (evt) => {
+      bar.setAttribute("opacity", "0.8");
+      const end = new Date(r.t + 3600000);
+      setTip(f.tip,
+        el("div", { class: "t" }, `${fmtDay(new Date(r.t))} ${fmtTime(new Date(r.t))}–${fmtTime(end)}`),
+        el("div", { class: "r" }, el("strong", {}, `${r.kWh.toFixed(2)} kWh`), el("span", { class: "muted" }, off ? "off-peak" : "peak")),
+        r.cost != null ? el("div", { class: "muted" }, `Leviton est. $${r.cost.toFixed(2)}`) : null);
+      const rect = f.svg.getBoundingClientRect();
+      placeTip(f.tip, f.box, ((x(r.t) + M.left) / f.width) * rect.width, evt.clientY ? evt.clientY - rect.top : 20);
+    };
+    const hide = () => { bar.removeAttribute("opacity"); f.tip.style.display = "none"; };
+    for (const n of [hitR, bar]) { n.addEventListener("pointermove", show); n.addEventListener("pointerdown", show); n.addEventListener("pointerleave", hide); }
+    bar.addEventListener("focus", show); bar.addEventListener("blur", hide);
+    g.append(bar, hitR);
+  }
+  card.append(f.box);
+
+  // Totals: the most recent off-peak window, and peak hours since it ended.
+  const spans = offPeakSpans(now - 2 * 86400000, now);
+  const lastSpan = spans.filter(([a]) => a <= now).pop();
+  const sum = (pred) => rows.filter(pred).reduce((a, r) => a + r.kWh, 0);
+  const sumCost = (pred) => rows.filter(pred).reduce((a, r) => a + (r.cost || 0), 0);
+  const totals = el("div", { class: "totals" });
+  if (lastSpan) {
+    const [a, b] = lastSpan;
+    const inSpan = (r) => r.t >= a && r.t < b;
+    const after = (r) => r.t >= b && !inOffPeak(r.t);
+    totals.append(
+      el("div", {}, el("strong", {}, `${sum(inSpan).toFixed(1)} kWh`), b > now ? "Off-peak so far tonight" : "Last off-peak window", el("span", { class: "muted" }, ` · $${sumCost(inSpan).toFixed(2)}`)),
+      b <= now ? el("div", {}, el("strong", {}, `${sum(after).toFixed(1)} kWh`), "Peak hours since", el("span", { class: "muted" }, ` · $${sumCost(after).toFixed(2)}`)) : null);
+  }
+  totals.append(el("div", {}, el("strong", {}, `${sum(() => true).toFixed(1)} kWh`), "Shown range", el("span", { class: "muted" }, ` · $${sumCost(() => true).toFixed(2)}`)));
+  card.append(totals);
+
+  const trs = rows.slice().reverse().map((r) => el("tr", {}, el("td", {}, `${fmtDay(new Date(r.t))} ${fmtTime(new Date(r.t))}`),
+    el("td", {}, r.kWh.toFixed(2)), el("td", {}, inOffPeak(r.t) ? "Off-peak" : "Peak"), el("td", {}, r.cost != null ? `$${r.cost.toFixed(2)}` : "")));
+  card.append(el("details", {}, el("summary", {}, "Show hourly energy as a table"),
+    el("div", { class: "scroll" }, el("table", {}, el("thead", {}, el("tr", {}, ...["Hour", "kWh", "Rate", "Leviton est."].map((h) => el("th", {}, h)))), el("tbody", {}, trs)))));
+  return card;
+}
+
+// --- learned runs ------------------------------------------------------------------
+function runsCard() {
+  const card = el("div", { class: "card" }, el("h2", {}, "Learned warm-ups"));
+  const runs = status.learnedRuns || [];
+  card.append(el("p", { class: "muted", style: "margin-top:0" },
+    runs.length
+      ? "Each heating run of 30+ minutes that needed 2°F+ is measured. The preheat start is worked out from these and tonight's forecast."
+      : "None yet. Every heating run of 30+ minutes that needs 2°F+, including ones you start by hand, gets measured here. Until then the preheat uses a deliberately slow guess, and starts no later than " + status.settings.latestStart + "."));
+  if (!runs.length) return card;
+  const trs = runs.slice().reverse().map((r) => el("tr", {},
+    el("td", {}, fmtWhen(new Date(r.start))),
+    el("td", {}, `${Math.round((r.end - r.start) / 60000)} min`),
+    el("td", {}, `${deg(r.startF)} → ${deg(r.endF)}`),
+    el("td", {}, deg(r.outdoorF)),
+    el("td", {}, `${r.ratePerHour.toFixed(2)}°F/h`)));
+  card.append(el("div", { class: "scroll" }, el("table", {}, el("thead", {}, el("tr", {}, ...["Started", "Length", "Indoor", "Outdoor", "Rate"].map((h) => el("th", {}, h)))), el("tbody", {}, trs))));
+  return card;
+}
+
+// Redraw charts at the new width.
+let resizeT;
+window.addEventListener("resize", () => { clearTimeout(resizeT); resizeT = setTimeout(() => status && render(), 150); });
+document.addEventListener("visibilitychange", () => { if (!document.hidden && token) load(); });
+
+if (token) { app.replaceChildren(el("p", { class: "muted" }, "Loading…")); load().then(schedule); }
+else renderGate();
+</script>
+</body>
+</html>
