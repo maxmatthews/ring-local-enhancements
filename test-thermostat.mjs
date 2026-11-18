@@ -12,6 +12,7 @@ import {
   extractCooldowns,
   fitCoolingModel,
   awayBankTarget,
+  bankHorizonHours,
   DEFAULTS,
 } from "./thermostat.mjs";
 import { summarizeAcState } from "./thinq.mjs";
@@ -334,6 +335,42 @@ test("away: bank target is what coasting the peak needs, with margin", () => {
   // 40 + (50 - 40) * e^(0.0125 * 16) = 52.2 -> 53
   assert.equal(p.bankF, 53);
   assert.ok(Math.abs(p.requiredF - (40 + 10 * Math.exp(0.0125 * 16))) < 1e-9);
+});
+
+test("horizon: how far into the peak banked heat pays", () => {
+  // Today's SC1V: 5.9c off, 20.2c on; prior k x safety = 0.0375.
+  const h = bankHorizonHours({ prices: { offPeak: 0.059, onPeak: 0.2021 }, k: 0.0375, copRatio: 1.3 });
+  assert.ok(Math.abs(h - Math.log(0.2021 / (0.059 * 1.3)) / 0.0375) < 1e-9);
+  assert.ok(h > 16, "pays for the whole peak at today's prices");
+  // A leaky house: banked heat is gone before it's needed late in the day.
+  assert.ok(bankHorizonHours({ prices: { offPeak: 0.059, onPeak: 0.2021 }, k: 0.15 }) < 7);
+  // No price gap -> nothing worth banking; no prices -> no limit.
+  assert.equal(bankHorizonHours({ prices: { offPeak: 0.2, onPeak: 0.2 }, k: 0.03 }), 0);
+  assert.equal(bankHorizonHours({ prices: null, k: 0.03 }), Infinity);
+});
+
+test("away: at today's prices it banks for the whole peak", () => {
+  const prices = { offPeak: 0.059, onPeak: 0.2021 };
+  const withPrices = awayPlan(at(19, 1), 52, {}, {}, { prices });
+  const without = awayPlan(at(19, 1), 52);
+  assert.equal(withPrices.bankF, without.bankF);
+  assert.equal(withPrices.worthF, withPrices.requiredF);
+});
+
+test("away: when late-peak heat isn't worth banking, it banks less and leaves the rest to the guard", () => {
+  // Leaky house, 40°F out: coasting the whole peak would need ~150°F (capped at
+  // 70); heat needed after ~6.5h isn't worth banking, so it banks ~67°F.
+  const cool = Array.from({ length: 96 }, (_, h) => ({ time: +at(18, 0) + h * 3600000, tempF: 40 }));
+  const prices = { offPeak: 0.059, onPeak: 0.2021 };
+  const leaky = { hourly: cool, coolingK: 0.12, outdoorF: 40 };
+  const full = awayPlan(at(19, 1), 52, {}, {}, leaky);
+  const priced = awayPlan(at(19, 1), 52, {}, {}, { ...leaky, prices });
+  assert.ok(priced.horizonHours < 16);
+  assert.ok(priced.worthF < priced.requiredF);
+  assert.ok(priced.bankF < full.bankF, `${priced.bankF} vs ${full.bankF}`);
+  // Never below the guard's off point even when nothing is worth banking.
+  const flat = awayPlan(at(19, 1), 52, {}, {}, { ...leaky, prices: { offPeak: 0.2, onPeak: 0.2 } });
+  assert.equal(flat.bankF, DEFAULTS.awayMinF + 3);
 });
 
 test("away: bank is capped, and never below the guard's off point", () => {

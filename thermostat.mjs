@@ -53,8 +53,18 @@ export const DEFAULTS = {
   awayMinF: 48,
   /** Away: the bank aims to still be this far above the floor when peak ends. */
   awayMarginF: 2,
-  /** Away: never bank above this, however cold the forecast. */
-  awayMaxBankF: 62,
+  /**
+   * Away: never bank above this, however cold the forecast. The empty house
+   * needs no comfort limit; what really bounds the bank is how far the heat
+   * pump gets overnight, and the price check below.
+   */
+  awayMaxBankF: 70,
+  /**
+   * Away: electricity per unit of heat at night relative to the afternoon --
+   * a heat pump is less efficient in the colder night air. Feeds the price
+   * check on how far into the peak banked heat still pays.
+   */
+  awayCopRatio: 1.3,
   /**
    * Heat loss, Newton's law: dT/dt = -k (indoor - outdoor), k per hour. The
    * prior (a ~33-hour time constant) is used until cool-downs are learned; it
@@ -284,6 +294,25 @@ function outdoorAt(hourly, t, fallbackF) {
 }
 
 /**
+ * How many hours into the peak banked heat still pays.
+ *
+ * A degree banked at the end of off-peak costs offPeak x copRatio (night heat
+ * takes more electricity per degree). If it's needed h hours into the peak,
+ * only e^(-k h) of it is still in the house -- the rest leaked out -- and that
+ * remainder saves the guard buying it at onPeak. So banking for hour h pays
+ * while e^(-k h) x onPeak > offPeak x copRatio:
+ *
+ *   h* = ln(onPeak / (offPeak x copRatio)) / k
+ *
+ * Infinity without prices (then the whole peak is banked for, as before);
+ * 0 when off-peak heat is no cheaper at all.
+ */
+export function bankHorizonHours({ prices, k, copRatio = DEFAULTS.awayCopRatio }) {
+  if (!prices || !(prices.offPeak > 0) || !(prices.onPeak > 0) || !(k > 0)) return Infinity;
+  return Math.max(0, Math.log(prices.onPeak / (prices.offPeak * copRatio)) / k);
+}
+
+/**
  * How warm the house must be at `from` to still be `endF` at `to` with the
  * unit off: Newton's law run backwards, an hour at a time, through the hourly
  * forecast. Hours the forecast doesn't cover use fallbackOutdoorF.
@@ -344,7 +373,8 @@ export function preheatStart({
  *
  * `device` is summarizeAcState()'s output. `state` is the persisted
  * { preheatKey, away, awayHeating, awayRun }. `coolingK`, `hourly` (the
- * forecast) and `outdoorF` only matter in away mode.
+ * forecast), `outdoorF` and `prices` ({offPeak, onPeak} $/kWh) only matter in
+ * away mode.
  *
  * Preheat fires once per night (state.preheatKey = that night's window key),
  * so changing the thermostat by hand after it starts sticks, and a restart
@@ -353,10 +383,20 @@ export function preheatStart({
  * @returns {{action: "idle"|"preheat"|"preheat-skip"|"away-heat-on"|"away-heat-off", reason: string, startAt?: Date,
  *   minutesNeeded?: number, key?: string, run?: "bank"|"guard", setpointF?: number, bankF?: number, requiredF?: number}}
  */
-export function planThermostat({ now, device, state = {}, ratePerHour, coolingK = DEFAULTS.defaultCoolingK, hourly = [], outdoorF = null, opts = {} }) {
+export function planThermostat({
+  now,
+  device,
+  state = {},
+  ratePerHour,
+  coolingK = DEFAULTS.defaultCoolingK,
+  hourly = [],
+  outdoorF = null,
+  prices = null,
+  opts = {},
+}) {
   const o = { ...DEFAULTS, ...opts };
 
-  if (state.away) return planAway({ now, device, state, ratePerHour, coolingK, hourly, outdoorF, o });
+  if (state.away) return planAway({ now, device, state, ratePerHour, coolingK, hourly, outdoorF, prices, o });
 
   const window = offPeakWindow(now, o.windowStart, o.windowEnd);
   if (!window.inWindow) return { action: "idle", reason: "outside the off-peak window" };
@@ -391,15 +431,18 @@ export function planThermostat({ now, device, state = {}, ratePerHour, coolingK 
  *   1. Floor guard (any hour): at awayMinF + 1 or below, heat until
  *      awayMinF + 3. Readings are whole degrees, so this is what keeps the
  *      house from going under awayMinF.
- *   2. Bank (off-peak, from the start time): heat to bankF -- enough to coast
- *      through the coming peak and end it awayMarginF above the floor -- and
- *      hold it there until off-peak ends.
+ *   2. Bank (off-peak, from the start time): heat to bankF and hold it there
+ *      until off-peak ends. bankF is enough to coast through the coming peak
+ *      and end it awayMarginF above the floor -- or, when prices say heat
+ *      needed late in the peak isn't worth buying early (bankHorizonHours),
+ *      enough to coast that far; the guard covers the rest. Capped at
+ *      awayMaxBankF.
  *   3. Coast (peak, and off-peak before the start time): the unit stays off.
  *      Anything running that isn't an unfinished guard run is switched off.
  *
  * It owns the unit while away. With no reading it does nothing rather than guess.
  */
-function planAway({ now, device, state, ratePerHour, coolingK, hourly, outdoorF, o }) {
+function planAway({ now, device, state, ratePerHour, coolingK, hourly, outdoorF, prices, o }) {
   const T = device?.indoorF;
   if (!Number.isFinite(T)) return { action: "idle", reason: "away: no indoor reading" };
 
@@ -413,15 +456,22 @@ function planAway({ now, device, state, ratePerHour, coolingK, hourly, outdoorF,
   // The window we're in, or the next one; the peak it has to carry the house through follows it.
   const window = offPeakWindow(now, o.windowStart, o.windowEnd);
   const peakEnd = offPeakWindow(window.end, o.windowStart, o.windowEnd).start;
-  const requiredF = awayBankTarget({
-    hourly,
-    from: window.end,
-    to: peakEnd,
-    k: coolingK * o.coolingSafety,
-    endF: o.awayMinF + o.awayMarginF,
-    fallbackOutdoorF: Number.isFinite(outdoorF) ? outdoorF : o.refOutdoorF,
-  });
-  const bankF = Math.min(o.awayMaxBankF, Math.max(guardOff, Math.ceil(requiredF)));
+  const k = coolingK * o.coolingSafety;
+  const coastTo = (to) =>
+    awayBankTarget({
+      hourly,
+      from: window.end,
+      to,
+      k,
+      endF: o.awayMinF + o.awayMarginF,
+      fallbackOutdoorF: Number.isFinite(outdoorF) ? outdoorF : o.refOutdoorF,
+    });
+  // What coasting the whole peak takes, and what's worth banking at these prices.
+  const requiredF = coastTo(peakEnd);
+  const horizonHours = bankHorizonHours({ prices, k, copRatio: o.awayCopRatio });
+  const horizonEnd = Math.min(+peakEnd, +window.end + horizonHours * MS_PER_HOUR);
+  const worthF = horizonEnd < +peakEnd ? coastTo(new Date(horizonEnd)) : requiredF;
+  const bankF = Math.min(o.awayMaxBankF, Math.max(guardOff, Math.ceil(worthF)));
   const { startAt, minutesNeeded } = preheatStart({
     indoorF: T,
     ratePerHour,
@@ -431,7 +481,7 @@ function planAway({ now, device, state, ratePerHour, coolingK, hourly, outdoorF,
     marginMinutes: o.marginMinutes,
     latestStart: o.latestStart,
   });
-  const plan = { bankF, requiredF, startAt, minutesNeeded, key: window.key };
+  const plan = { bankF, requiredF, worthF, horizonHours: Number.isFinite(horizonHours) ? horizonHours : null, startAt, minutesNeeded, key: window.key };
   const on = (runKind, target, reason) => ({ ...plan, action: "away-heat-on", run: runKind, setpointF: setpoint(target), reason });
   const off = (reason) => ({ ...plan, action: "away-heat-off", reason });
   const idle = (reason) => ({ ...plan, action: "idle", reason });

@@ -166,6 +166,7 @@ const THERMOSTAT_OPTS = {
   awayMinF: num("THERMOSTAT_AWAY_MIN_F", num("THERMOSTAT_AWAY_TEMP_F", THERMOSTAT_DEFAULTS.awayMinF)),
   awayMarginF: num("THERMOSTAT_AWAY_MARGIN_F", THERMOSTAT_DEFAULTS.awayMarginF),
   awayMaxBankF: num("THERMOSTAT_AWAY_MAX_BANK_F", THERMOSTAT_DEFAULTS.awayMaxBankF),
+  awayCopRatio: num("THERMOSTAT_AWAY_COP_RATIO", THERMOSTAT_DEFAULTS.awayCopRatio),
 };
 const THERMOSTAT_TICK_MS = parseInt(process.env.THERMOSTAT_TICK_MS || "300000", 10);
 // Until a warm-up has been learned, start no later than this (the hand-run
@@ -1918,6 +1919,8 @@ async function thermostatTick() {
       coolingK: cooling.k,
       hourly: outdoor?.hourly ?? [],
       outdoorF: outdoor?.nowF ?? null,
+      // National Grid's latest supply + delivery, when fetched: the away bank's price check.
+      prices: ngridStatus().totals,
       opts: { ...THERMOSTAT_OPTS, latestStart },
     });
     thermostatLast = {
@@ -1936,7 +1939,9 @@ async function thermostatTick() {
       thermostatAnnouncedKey = announceKey;
       log(
         `Thermostat: away -- bank to ${plan.bankF}°F by ${THERMOSTAT_OPTS.windowEnd} (coasting the peak needs ` +
-          `${plan.requiredF.toFixed(1)}°F${plan.requiredF > plan.bankF ? `, capped at ${plan.bankF}°F` : ""}), ` +
+          `${plan.requiredF.toFixed(1)}°F` +
+          `${plan.worthF < plan.requiredF ? `; at these prices only the first ${plan.horizonHours.toFixed(1)}h of it is worth banking, ${plan.worthF.toFixed(1)}°F` : ""}` +
+          `${Math.ceil(plan.worthF) > plan.bankF ? `; capped at ${plan.bankF}°F` : ""}), ` +
           `expected ~${plan.startAt.toLocaleTimeString()}; floor ${THERMOSTAT_OPTS.awayMinF}°F -- ${cooling.describe}`
       );
     } else if (plan.startAt && thermostatAnnouncedKey !== announceKey) {

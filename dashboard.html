@@ -254,8 +254,13 @@ function planCard() {
       ? `Away: bank to ${p.bankF}° by ${s.windowEnd}${p.startAt ? ` (from ~${fmtTime(new Date(p.startAt))})` : ""}, then coast through peak`
       : "Away";
     if (p.requiredF != null) {
-      detail.push(`Coasting the peak needs ${p.requiredF.toFixed(1)}° at ${s.windowEnd}` +
-        (p.requiredF > p.bankF ? `, capped at ${p.bankF}° -- the floor guard may run during peak.` : "."));
+      let why = `Coasting the whole peak needs ${p.requiredF.toFixed(1)}° at ${s.windowEnd}`;
+      if (p.worthF != null && p.worthF < p.requiredF) {
+        why += `; at today's prices heat is only worth banking for the first ${p.horizonHours.toFixed(1)} h of it (${p.worthF.toFixed(1)}°)`;
+      }
+      if (Math.ceil(p.worthF ?? p.requiredF) > p.bankF) why += `, capped at ${p.bankF}°`;
+      why += p.bankF < Math.ceil(p.requiredF) ? " -- the floor guard covers the rest of the peak." : ".";
+      detail.push(why);
     }
     detail.push(`Never below ${s.awayMinF}°: heats at ${s.awayMinF + 1}° any hour, until ${s.awayMinF + 3}°.`);
     if (last?.coolingModel) detail.push(`Heat loss: ${last.coolingModel}.`);

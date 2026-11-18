@@ -431,9 +431,24 @@ three layers, highest priority first:
    `THERMOSTAT_AWAY_MARGIN_F` (2°F) above the floor at 23:00. It runs Newton's
    law of cooling backwards through tomorrow's hourly forecast. Then it heats
    to that **bank** as late in the night as the warm-up rate allows, the same
-   way the 64°F preheat is timed, and tops it up until 07:00. The bank never
-   goes above `THERMOSTAT_AWAY_MAX_BANK_F` (62°F). On a night that would need
-   more, the guard covers the gap during peak.
+   way the 64°F preheat is timed, and tops it up until 07:00. It never banks
+   more than the peak needs, since a warmer house only leaks faster. Two
+   limits can make it bank less:
+   - **Price check.** A degree banked at 07:00 costs the off-peak price ×
+     `THERMOSTAT_AWAY_COP_RATIO` (1.3, because the heat pump is less efficient
+     in the colder night). If it's only needed h hours into the peak, just
+     `e^(−k·h)` of it is still there to save the guard buying it at on-peak.
+     So banking pays only up to `h* = ln(onPeak ÷ (offPeak × 1.3)) ÷ k` hours
+     into the peak, and it banks just enough to coast that far. At SC1V's
+     5.9¢ / 20.2¢ and the prior `k`, h* is ~26 h, longer than the peak, so it
+     banks for all of it. A leakier house or a narrower price gap shortens it.
+     Without National Grid prices there's no price limit.
+   - **Cap.** `THERMOSTAT_AWAY_MAX_BANK_F` (70°F). The empty house needs no
+     comfort limit; in practice the bank is bounded by how far the heat pump
+     gets overnight. If it can't make the target, it starts at 23:00 and heats
+     all night.
+
+   Whatever the bank doesn't cover, the guard covers during peak.
 3. **Coast, peak.** From 07:00 to 23:00 the unit stays off. Anything else
    running is switched off.
 
@@ -450,8 +465,8 @@ a drop of 2°F or more gives a cooling constant `k`
 (`dT/dt = −k·(indoor − outdoor)`). The duration-weighted mean is used once
 there are two. Until then the prior is `k = 0.03/h`, a ~33-hour time constant
 that leans leaky, and `k` is scaled ×1.25 on top. With the prior, a 30°F day
-already calls for more than the 62°F cap, so expect the guard to run some
-during peak until real cool-downs are learned.
+calls for a bank of ~66°F, so expect long overnight runs until real
+cool-downs are learned.
 
 Away mode is switched from the dashboard, or over the same listener as the
 meeting plug. These endpoints need no token: they're open to the home network
