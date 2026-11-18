@@ -445,8 +445,16 @@ curl -X POST -H "X-Requested-By: me" http://pi.local:8787/thermostat/away
 
 ### Dashboard
 
-`http://pi.local:8787/dashboard` (also `/`) on the home network. No token. It
-shows:
+`http://pi.local:8787/dashboard` (also `/`). No token. Reachable from:
+
+| From | URL | Why it works |
+| --- | --- | --- |
+| Home LAN | `http://pi.local:8787/dashboard` | ufw allows 8787 from `192.168.1.0/24` |
+| Tailscale | `http://100.113.120.45:8787/dashboard` | Tailscale's `ts-input` chain accepts all of `tailscale0` ahead of ufw |
+| WireGuard | `http://10.100.0.1:8787/dashboard` | ufw rule `allow in on wg0 to any port 8787` |
+| Internet | — | No Cloudflare tunnel routes to 8787, and ufw drops it from anywhere else |
+
+Remote access over the VPNs is intended. It shows:
 
 - indoor and outdoor temperature, what the unit is doing, and the heat pump's
   draw from the Leviton breaker
