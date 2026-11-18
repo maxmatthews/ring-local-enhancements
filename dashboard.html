@@ -478,6 +478,11 @@ function hourStart(row) {
   return +new Date(Y, Mo - 1, D, Number(hm.slice(0, 2)));
 }
 
+// National Grid's price for the hour when the Pi has it; Leviton's estimate otherwise.
+const costOf = (r) => (r.ngCost != null ? r.ngCost : r.cost);
+const costSource = () => (history?.rates?.totals ? "National Grid" : "Leviton est.");
+const cents = (v) => `${(v * 100).toFixed(1)}¢`;
+
 function inOffPeak(t) {
   return offPeakSpans(t - 86400000, t + 86400000).some(([a, b]) => t >= a && t < b);
 }
@@ -534,7 +539,9 @@ function energyCard() {
       setTip(f.tip,
         el("div", { class: "t" }, `${fmtDay(new Date(r.t))} ${fmtTime(new Date(r.t))}–${fmtTime(end)}`),
         el("div", { class: "r" }, el("strong", {}, `${r.kWh.toFixed(2)} kWh`), el("span", { class: "muted" }, off ? "off-peak" : "peak")),
-        r.cost != null ? el("div", { class: "muted" }, `Leviton est. $${r.cost.toFixed(2)}`) : null);
+        r.ngCost != null
+          ? el("div", { class: "muted" }, `$${r.ngCost.toFixed(2)} at ${cents(r.pricePerKWh)}/kWh${r.period === "superPeak" ? " (super-peak)" : ""}`)
+          : r.cost != null ? el("div", { class: "muted" }, `Leviton est. $${r.cost.toFixed(2)}`) : null);
       const rect = f.svg.getBoundingClientRect();
       placeTip(f.tip, f.box, ((x(r.t) + M.left) / f.width) * rect.width, evt.clientY ? evt.clientY - rect.top : 20);
     };
@@ -549,7 +556,8 @@ function energyCard() {
   const spans = offPeakSpans(now - 2 * 86400000, now);
   const lastSpan = spans.filter(([a]) => a <= now).pop();
   const sum = (pred) => rows.filter(pred).reduce((a, r) => a + r.kWh, 0);
-  const sumCost = (pred) => rows.filter(pred).reduce((a, r) => a + (r.cost || 0), 0);
+  const sumCost = (pred) => rows.filter(pred).reduce((a, r) => a + (costOf(r) || 0), 0);
+  const saved = (pred) => rows.filter(pred).reduce((a, r) => a + (r.ngCostAtOnPeak != null ? r.ngCostAtOnPeak - r.ngCost : 0), 0);
   const totals = el("div", { class: "totals" });
   if (lastSpan) {
     const [a, b] = lastSpan;
@@ -557,15 +565,27 @@ function energyCard() {
     const after = (r) => r.t >= b && !inOffPeak(r.t);
     totals.append(
       el("div", {}, el("strong", {}, `${sum(inSpan).toFixed(1)} kWh`), b > now ? "Off-peak so far tonight" : "Last off-peak window", el("span", { class: "muted" }, ` · $${sumCost(inSpan).toFixed(2)}`)),
+      history?.rates?.totals ? el("div", {}, el("strong", {}, `$${saved(inSpan).toFixed(2)}`), b > now ? "Saved so far tonight" : "Saved that night", el("span", { class: "muted" }, " vs the same kWh on-peak")) : null,
       b <= now ? el("div", {}, el("strong", {}, `${sum(after).toFixed(1)} kWh`), "Peak hours since", el("span", { class: "muted" }, ` · $${sumCost(after).toFixed(2)}`)) : null);
   }
   totals.append(el("div", {}, el("strong", {}, `${sum(() => true).toFixed(1)} kWh`), "Shown range", el("span", { class: "muted" }, ` · $${sumCost(() => true).toFixed(2)}`)));
   card.append(totals);
+  const rt = history?.rates;
+  if (rt?.totals) {
+    const day = rt.supplyDay ? new Date(`${rt.supplyDay}T12:00`) : null;
+    card.append(el("p", { class: "muted", style: "margin:10px 0 0" },
+      `National Grid ${rt.serviceClass}: off-peak ${cents(rt.totals.offPeak)}, on-peak ${cents(rt.totals.onPeak)}` +
+      `${rt.totals.superPeak ? `, super-peak ${cents(rt.totals.superPeak)}` : ""} per kWh (supply + delivery; supply for ${day ? fmtDay(day) : "?"}).` +
+      " Excludes the small riders on the rate statements and fixed monthly charges."));
+  } else if (rt?.enabled) {
+    card.append(el("p", { class: "muted", style: "margin:10px 0 0" }, "National Grid prices not fetched yet; costs shown are Leviton's estimate."));
+  }
 
   const trs = rows.slice().reverse().map((r) => el("tr", {}, el("td", {}, `${fmtDay(new Date(r.t))} ${fmtTime(new Date(r.t))}`),
-    el("td", {}, r.kWh.toFixed(2)), el("td", {}, inOffPeak(r.t) ? "Off-peak" : "Peak"), el("td", {}, r.cost != null ? `$${r.cost.toFixed(2)}` : "")));
+    el("td", {}, r.kWh.toFixed(2)), el("td", {}, inOffPeak(r.t) ? "Off-peak" : r.period === "superPeak" ? "Super-peak" : "Peak"),
+    el("td", {}, r.pricePerKWh != null ? cents(r.pricePerKWh) : ""), el("td", {}, costOf(r) != null ? `$${costOf(r).toFixed(2)}` : "")));
   card.append(el("details", {}, el("summary", {}, "Show hourly energy as a table"),
-    el("div", { class: "scroll" }, el("table", {}, el("thead", {}, el("tr", {}, ...["Hour", "kWh", "Rate", "Leviton est."].map((h) => el("th", {}, h)))), el("tbody", {}, trs)))));
+    el("div", { class: "scroll" }, el("table", {}, el("thead", {}, el("tr", {}, ...["Hour", "kWh", "Period", "Price/kWh", `Cost (${costSource()})`].map((h) => el("th", {}, h)))), el("tbody", {}, trs)))));
   return card;
 }
 

@@ -506,6 +506,34 @@ in fast mode, and setting that takes a write. So the dashboard leads with the
 last complete hour's average from the hourly history, and shows the live
 reading only as a footnote with its age.
 
+### Electricity prices (National Grid)
+
+The dashboard prices the heat pump's hourly kWh with National Grid's SC1V
+(Residential Voluntary Time of Use) rates for the Central load zone, and shows
+what each night saved compared with the same kWh at on-peak prices. Once a day
+the Pi fetches:
+
+- **Supply**: yesterday's off-peak, on-peak and super-peak $/kWh from the
+  API behind National Grid's
+  [Electric Supply Charge](https://www.nationalgridus.com/Upstate-NY-Home/Supply-Costs/Electric-Supply-Charge)
+  lookup. A day's prices are only published the next day. The API is
+  undocumented and uses the subscription key that page ships to every browser.
+  Calling it once a day was an explicit decision, and it may break without
+  notice.
+- **Delivery**: the SC-1 VTOU on-peak and off-peak ¢/kWh, read from the public
+  [Service Rates](https://www.nationalgridus.com/Upstate-NY-Home/Rates/Service-Rates)
+  page.
+
+Each hour is priced by its VTOU period: off-peak 23:00–07:00 every day,
+super-peak 14:00–18:00 on June–August weekdays except July 4th, on-peak
+otherwise. The price is supply plus delivery. It leaves out the small riders
+listed only on the PDF rate statements (system benefits, revenue decoupling,
+transmission adjustment, ...) and the fixed monthly charges, so it's close but
+not exact. A failed fetch retries hourly, at most three times a day. It never
+affects heating control; prices just go stale. Prices are kept in
+`.ngrid-rates.json` on the Pi. `ngrid.mjs` holds the client and the pure
+parsing, tested in `test-ngrid.mjs`.
+
 Away mode survives restarts (`.thermostat-state.json`). It depends on the Pi
 and the ThinQ cloud being up. If either is down, nothing switches the heat back
 on.
@@ -888,6 +916,8 @@ for more than ~30 days, re-run `npm run pair-smartthings`.
 | `weather.mjs` | Open-Meteo outdoor temperature + hourly forecast |
 | `leviton.mjs` | Leviton cloud API, read-only: breakers and hourly energy, for the dashboard |
 | `dashboard.html` | The heat pump dashboard, served at `/dashboard` |
+| `ngrid.mjs` | National Grid supply + delivery prices and VTOU periods, for the dashboard's costs |
+| `test-ngrid.mjs` | Unit tests for the above (`npm test`) |
 | `test-thermostat.mjs` | Unit tests for the thermostat logic (`npm test`) |
 | `mac/` | The Mac half of feature 5: MeetingBar join script, helper, installer |
 | `pair-smartthings.mjs` | One-time SmartThings OAuth pairing helper |
@@ -898,8 +928,8 @@ for more than ~30 days, re-run `npm run pair-smartthings`.
 | `.env.example`, `blind-sensor-map.json.example` | Tracked templates |
 
 `.env`, `.env.pi.bak`, `blind-sensor-map.json`, `.meeting-plug-state.json`,
-`.govee-lights-state.json`, `.thermostat-state.json` and
-`.thermostat-history.jsonl` are gitignored and exist only where they're used. Never put real secrets in `.env.example`.
+`.govee-lights-state.json`, `.thermostat-state.json`,
+`.thermostat-history.jsonl` and `.ngrid-rates.json` are gitignored and exist only where they're used. Never put real secrets in `.env.example`.
 
 ## Caveats
 

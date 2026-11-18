@@ -40,6 +40,7 @@ import {
 } from "./thermostat.mjs";
 import { fetchOutdoor } from "./weather.mjs";
 import { createLevitonClient, findBreaker } from "./leviton.mjs";
+import { fetchSupplyPrices, fetchDeliveryRates, priceAt } from "./ngrid.mjs";
 import SunCalc from "suncalc";
 import { createServer } from "http";
 import { timingSafeEqual, randomUUID } from "crypto";
@@ -175,6 +176,12 @@ const THERMOSTAT_PREHEAT_LATEST_START = process.env.THERMOSTAT_PREHEAT_LATEST_ST
 const LEVITON_EMAIL = process.env.LEVITON_EMAIL;
 const LEVITON_PASSWORD = process.env.LEVITON_PASSWORD;
 const LEVITON_BREAKER_NAME = process.env.LEVITON_BREAKER_NAME || "Heat Pump";
+// National Grid prices for the dashboard's cost figures, fetched once a day.
+// Load zone 2 = Central; SC1V goes to the API as class SC1 plus its description.
+const NGRID_RATES_ENABLED = (process.env.NGRID_RATES_ENABLED || "true").toLowerCase() !== "false";
+const NGRID_LOAD_ZONE_ID = parseInt(process.env.NGRID_LOAD_ZONE_ID || "2", 10);
+const NGRID_SERVICE_CLASS = process.env.NGRID_SERVICE_CLASS || "SC1";
+const NGRID_SERVICE_CLASS_DESCRIPTION = process.env.NGRID_SERVICE_CLASS_DESCRIPTION || "(SC1V) Residential Voluntary Time of Use";
 const SMOKE_UNLOCK_COOLDOWN_SECONDS = parseInt(process.env.SMOKE_UNLOCK_COOLDOWN_SECONDS || "300", 10);
 const BLIND_CLOSED_LEVEL = 100;
 const BLIND_CLOSE_SPACING_MS = 10 * 1000;
@@ -1885,6 +1892,7 @@ function thermostatModel() {
 
 async function thermostatTick() {
   refreshLevitonLive().catch((err) => logError("Leviton refresh failed", err));
+  refreshNgridRates().catch((err) => logError("National Grid refresh failed", err));
   if (thermostatTickBusy) return;
   thermostatTickBusy = true;
   try {
@@ -2086,6 +2094,125 @@ async function heatPumpEnergy(fromMs, toMs) {
   return out;
 }
 
+// --- National Grid prices (dashboard only) -------------------------------------
+
+// { supply: { "YYYY-MM-DD": {offPeak, onPeak, superPeak} }, delivery: {onPeak, offPeak},
+//   deliveryAt, lastSuccessDay, attemptDay, attempts, lastAttemptAt }
+const NGRID_RATES_FILE = resolve(__dirname, ".ngrid-rates.json");
+const NGRID_MAX_ATTEMPTS_PER_DAY = 3;
+const NGRID_RETRY_MS = 60 * 60 * 1000;
+const NGRID_KEEP_DAYS = 400;
+let ngridRates = { supply: {}, delivery: null };
+let ngridBusy = false;
+
+function loadNgridRates() {
+  if (!existsSync(NGRID_RATES_FILE)) return { supply: {}, delivery: null };
+  try {
+    return { supply: {}, delivery: null, ...JSON.parse(readFileSync(NGRID_RATES_FILE, "utf-8")) };
+  } catch (err) {
+    logError("Ignoring unreadable National Grid rates file", err);
+    return { supply: {}, delivery: null };
+  }
+}
+
+function saveNgridRates() {
+  try {
+    writeFileSync(NGRID_RATES_FILE, JSON.stringify(ngridRates));
+  } catch (err) {
+    logError("Could not persist the National Grid rates", err);
+  }
+}
+
+// Once a day: yesterday's supply prices (today's aren't published until
+// tomorrow) and the delivery charges. A failure retries hourly, at most three
+// times a day, and never touches heating control -- costs just go stale.
+async function refreshNgridRates() {
+  if (!NGRID_RATES_ENABLED || ngridBusy) return;
+  const now = new Date();
+  const today = localDateKey(now);
+  if (ngridRates.lastSuccessDay === today) return;
+  if (ngridRates.attemptDay === today) {
+    if (ngridRates.attempts >= NGRID_MAX_ATTEMPTS_PER_DAY) return;
+    if (Date.now() - (ngridRates.lastAttemptAt || 0) < NGRID_RETRY_MS) return;
+  }
+  ngridBusy = true;
+  ngridRates = {
+    ...ngridRates,
+    attemptDay: today,
+    attempts: ngridRates.attemptDay === today ? (ngridRates.attempts || 0) + 1 : 1,
+    lastAttemptAt: Date.now(),
+  };
+  try {
+    const yesterday = localDateKey(new Date(now.getFullYear(), now.getMonth(), now.getDate() - 1));
+    const supply = await fetchSupplyPrices({
+      day: yesterday,
+      zoneId: NGRID_LOAD_ZONE_ID,
+      serviceClass: NGRID_SERVICE_CLASS,
+      serviceClassDescription: NGRID_SERVICE_CLASS_DESCRIPTION,
+    });
+    const delivery = await fetchDeliveryRates();
+    const cutoff = localDateKey(new Date(now.getFullYear(), now.getMonth(), now.getDate() - NGRID_KEEP_DAYS));
+    const kept = Object.fromEntries(Object.entries({ ...ngridRates.supply, [yesterday]: supply }).filter(([d]) => d >= cutoff));
+    ngridRates = { ...ngridRates, supply: kept, delivery, deliveryAt: new Date().toISOString(), lastSuccessDay: today };
+    const c = (v) => `${(v * 100).toFixed(2)}¢`;
+    log(
+      `National Grid: ${yesterday} supply off ${c(supply.offPeak)} / on ${c(supply.onPeak)}` +
+        `${supply.superPeak ? ` / super ${c(supply.superPeak)}` : ""}; delivery off ${c(delivery.offPeak)} / on ${c(delivery.onPeak)}`
+    );
+  } catch (err) {
+    logError(`National Grid rates refresh failed (attempt ${ngridRates.attempts}/${NGRID_MAX_ATTEMPTS_PER_DAY} today)`, err);
+  } finally {
+    saveNgridRates();
+    ngridBusy = false;
+  }
+}
+
+/** That day's supply prices, else the closest earlier day we have, else the newest. */
+function supplyFor(day) {
+  const days = Object.keys(ngridRates.supply || {}).sort();
+  if (!days.length) return null;
+  const earlier = days.filter((d) => d <= day);
+  return ngridRates.supply[earlier.length ? earlier[earlier.length - 1] : days[days.length - 1]];
+}
+
+function hourDate(row) {
+  const [d, hm] = row.hour.split(" ");
+  const [Y, M, D] = d.split("-").map(Number);
+  return new Date(Y, M - 1, D, Number(hm.slice(0, 2)));
+}
+
+/** Energy rows with National Grid's price for that hour and what it cost. */
+function priceEnergy(rows) {
+  if (!ngridRates.delivery) return rows;
+  return rows.map((r) => {
+    const d = hourDate(r);
+    const p = priceAt(d, supplyFor(localDateKey(d)), ngridRates.delivery);
+    if (!p) return r;
+    const onPeak = priceAt(new Date(d.getFullYear(), d.getMonth(), d.getDate(), 12), supplyFor(localDateKey(d)), ngridRates.delivery);
+    return { ...r, period: p.period, pricePerKWh: p.total, ngCost: r.kWh * p.total, ngCostAtOnPeak: r.kWh * onPeak.total };
+  });
+}
+
+function ngridStatus() {
+  if (!NGRID_RATES_ENABLED) return { enabled: false };
+  const days = Object.keys(ngridRates.supply || {}).sort();
+  const supplyDay = days[days.length - 1] || null;
+  const supply = supplyDay ? ngridRates.supply[supplyDay] : null;
+  const delivery = ngridRates.delivery;
+  return {
+    enabled: true,
+    serviceClass: NGRID_SERVICE_CLASS_DESCRIPTION,
+    loadZoneId: NGRID_LOAD_ZONE_ID,
+    supplyDay,
+    supply,
+    delivery,
+    deliveryAt: ngridRates.deliveryAt ?? null,
+    totals: supply && delivery
+      ? { offPeak: supply.offPeak + delivery.offPeak, onPeak: supply.onPeak + delivery.onPeak, superPeak: supply.superPeak != null ? supply.superPeak + delivery.onPeak : null }
+      : null,
+  };
+}
+
 /** Every Nth sample, so a long range stays a few thousand points. */
 function downsample(samples, max = 2000) {
   if (samples.length <= max) return samples;
@@ -2101,7 +2228,8 @@ async function thermostatHistoryBody(hours) {
     from: new Date(fromMs).toISOString(),
     to: new Date(toMs).toISOString(),
     samples: downsample(samples),
-    energy: await heatPumpEnergy(fromMs, toMs),
+    energy: priceEnergy(await heatPumpEnergy(fromMs, toMs)),
+    rates: ngridStatus(),
     breaker: levitonBreaker,
     levitonEnabled,
   };
@@ -2136,6 +2264,7 @@ function thermostatStatusBody() {
     learnedRuns: extractWarmups(thermostatHistory).slice(-20),
     samples: thermostatHistory.length,
     breaker: levitonBreaker,
+    rates: ngridStatus(),
     window: (() => {
       const w = offPeakWindow(new Date(), THERMOSTAT_OPTS.windowStart, THERMOSTAT_OPTS.windowEnd);
       return { start: w.start.toISOString(), end: w.end.toISOString(), inWindow: w.inWindow };
@@ -2174,6 +2303,7 @@ function startThermostat() {
   }
   thermostatState = loadThermostatState();
   thermostatHistory = loadThermostatHistory();
+  ngridRates = loadNgridRates();
   const model = thermostatModel();
   log(`  Thermostat: ${thermostatHistory.length} samples, warm-up model: ${model.describe}; cooling: ${thermostatCoolingModel().describe}`);
   if (thermostatState.away) log(`  Thermostat: in away mode since ${thermostatState.awaySince}`);

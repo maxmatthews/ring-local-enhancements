@@ -31,6 +31,10 @@
   restore) and `.thermostat-history.jsonl` (the samples the warm-up model
   learns from) are the Pi's own too and excluded from the deploy. Losing the
   history resets the learning.
+- `.ngrid-rates.json` (the daily National Grid prices) is the Pi's own too and
+  excluded from the deploy. The supply prices come from an undocumented
+  National Grid API using its web page's public key: the owner approved one
+  call a day. Keep it at that.
 - The Leviton breaker integration (`leviton.mjs`) is read-only by decision:
   dashboard display only, never a write to the panel or a breaker switch.
 - Managed by pm2 (`ecosystem.config.cjs`), running under the pi user's pm2

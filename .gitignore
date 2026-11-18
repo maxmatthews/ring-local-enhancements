@@ -6,3 +6,4 @@ blind-sensor-map.json
 .govee-lights-state.json
 .thermostat-state.json
 .thermostat-history.jsonl
+.ngrid-rates.json
