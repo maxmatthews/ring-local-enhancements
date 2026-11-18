@@ -461,10 +461,12 @@ token. Everything else comes from `GET /thermostat/status` and
 `LEVITON_PASSWORD` and only reads; it never writes to the panel or switches a
 breaker. LG's ThinQ API is the only control path. Leviton has no local API, so
 this goes through Leviton's cloud API (my.leviton.com). The breaker's live
-watts are only as fresh as the panel's last report, often an hour old. The
-panel only reports quickly while the My Leviton app holds it in fast mode, and
-setting that takes a write. The dashboard shows how old the reading is. Hourly
-kWh comes from Leviton's per-day history and is reliable.
+watts are unreliable: often an hour old, and on the first day they disagreed
+with Leviton's own hourly history (4.2 kW "live" during an hour the history put
+at 0.01 kWh). The panel only reports quickly while the My Leviton app holds it
+in fast mode, and setting that takes a write. So the dashboard leads with the
+last complete hour's average from the hourly history, and shows the live
+reading only as a footnote with its age.
 
 Away mode survives restarts (`.thermostat-state.json`). It depends on the Pi
 and the ThinQ cloud being up. If either is down, nothing switches the heat back

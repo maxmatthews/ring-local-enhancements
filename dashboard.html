@@ -249,15 +249,21 @@ function unitTile(dev) {
     on ? statusPill("var(--good)", "Running") : null);
 }
 
+// Leads with the last complete hour from Leviton's energy history: that's
+// measured. The panel's "live" watts can be an hour old and disagree with it
+// outright, so it's only a footnote.
 function breakerTile(b) {
-  if (!b) return tile("Heat pump draw", "–", history?.levitonEnabled === false ? "Leviton not configured" : "No breaker reading yet");
-  const at = b.lastUpdated ? new Date(b.lastUpdated) : null;
-  const ageMin = at ? Math.round((Date.now() - at) / 60000) : null;
-  const kw = b.watts == null ? "–" : `${(b.watts / 1000).toFixed(b.watts >= 10000 ? 0 : 1)} kW`;
-  const stale = ageMin != null && ageMin > 15;
-  return tile("Heat pump draw", kw,
-    `${b.amps ?? "–"} A · ${at ? `as of ${fmtTime(at)}` : "time unknown"}`,
-    stale ? statusPill("var(--warn)", `Panel reading is ${ageMin} min old`) : null);
+  if (history?.levitonEnabled === false) return tile("Heat pump, last hour", "–", "Leviton not configured");
+  const now = Date.now();
+  const done = (history?.energy || []).map((r) => ({ ...r, t: hourStart(r) })).filter((r) => r.t + 3600000 <= now);
+  const lastHour = done[done.length - 1];
+  const at = b?.lastUpdated ? new Date(b.lastUpdated) : null;
+  const ageMin = at ? Math.round((now - at) / 60000) : null;
+  const live = b?.watts == null ? null : `Panel live reading ${(b.watts / 1000).toFixed(1)} kW${ageMin != null ? `, ${ageMin} min old` : ""}`;
+  if (!lastHour) return tile("Heat pump, last hour", "–", live || "No energy data yet");
+  return tile("Heat pump, last hour", `${lastHour.kWh.toFixed(2)} kW`,
+    live || "",
+    el("div", { class: "sub" }, `avg ${fmtTime(new Date(lastHour.t))}–${fmtTime(new Date(lastHour.t + 3600000))}`));
 }
 
 function planCard() {
