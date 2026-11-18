@@ -216,7 +216,7 @@ function statusPill(color, text) {
 
 function unitTile(dev) {
   if (status.away) {
-    return tile("Unit", "Away", `Holding ~${status.settings.awayF}° since ${fmtWhen(new Date(status.awaySince))}`,
+    return tile("Unit", "Away", `Never below ${status.settings.awayMinF}° · since ${fmtWhen(new Date(status.awaySince))}`,
       statusPill(status.awayHeating ? "var(--series-2)" : "var(--text-3)", status.awayHeating ? "Heating" : "Off"));
   }
   if (!dev) return tile("Unit", "–", "");
@@ -249,8 +249,17 @@ function planCard() {
   const s = status.settings;
   let headline, detail = [];
   if (status.away) {
-    headline = `Away: holding ~${s.awayF}° (heat below ${s.awayF - s.awayBandF}°, off above ${s.awayF + s.awayBandF}°)`;
-    detail.push("The overnight preheat is paused while away.");
+    const p = plan || {};
+    headline = p.bankF != null
+      ? `Away: bank to ${p.bankF}° by ${s.windowEnd}${p.startAt ? ` (from ~${fmtTime(new Date(p.startAt))})` : ""}, then coast through peak`
+      : "Away";
+    if (p.requiredF != null) {
+      detail.push(`Coasting the peak needs ${p.requiredF.toFixed(1)}° at ${s.windowEnd}` +
+        (p.requiredF > p.bankF ? `, capped at ${p.bankF}° -- the floor guard may run during peak.` : "."));
+    }
+    detail.push(`Never below ${s.awayMinF}°: heats at ${s.awayMinF + 1}° any hour, until ${s.awayMinF + 3}°.`);
+    if (last?.coolingModel) detail.push(`Heat loss: ${last.coolingModel}.`);
+    detail.push("The 64° preheat is paused while away.");
   } else if (!status.preheatEnabled) {
     headline = "Overnight preheat is turned off";
   } else if (plan?.startAt) {
@@ -287,7 +296,7 @@ function awayButton() {
   return el("button", { class: away ? "primary" : "", onclick: async (e) => {
       const msg = away
         ? "Turn away mode off? The unit goes back to how it was when you left."
-        : `Turn away mode on? The unit switches off and holds the house near ${status.settings.awayF}°.`;
+        : `Turn away mode on? Heat is banked on off-peak power and the house never drops below ${status.settings.awayMinF}°.`;
       if (!confirm(msg)) return;
       e.target.disabled = true;
       try { await api(away ? "/thermostat/home" : "/thermostat/away", { method: "POST" }); }

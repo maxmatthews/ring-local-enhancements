@@ -11,7 +11,7 @@ Local-network glue for a Ring + IKEA Dirigera home. One Node service
 | 4 | **Level-sync retry** — re-send a house-wide blind level to the blinds that missed it, plus a full-open nudge | Ring + Dirigera | `BLIND_LEVEL_SYNC_ENABLED=false` |
 | 5 | **Meeting-triggered smart plug** — switch a SmartThings plug on when MeetingBar joins a meeting, off when the meeting is scheduled to end | Ring + SmartThings + a Mac | omit `MEETING_PLUG_TOKEN` |
 | 6 | **Govee outdoor lights** — permanent outdoor lights on at sunset and off at 23:15, with a random holiday scene in the run-up to a holiday | Govee + `LATITUDE` / `LONGITUDE` | omit `GOVEE_API_KEY` |
-| 7 | **Heat pump preheat + away mode** — heat the house to 64°F just before the 07:00 end of off-peak power, starting as late as the learned warm-up rate allows; hold ~48°F while away; local dashboard with Leviton breaker readings | LG ThinQ (+ `LATITUDE` / `LONGITUDE` for outdoor temps) | omit `THINQ_PAT` |
+| 7 | **Heat pump preheat + away mode** — heat the house to 64°F just before the 07:00 end of off-peak power, starting as late as the learned warm-up rate allows; while away, never below 48°F with heat banked off-peak; local dashboard with Leviton breaker readings | LG ThinQ (+ `LATITUDE` / `LONGITUDE` for outdoor temps) | omit `THINQ_PAT` |
 
 Each feature degrades independently: missing config disables just that
 feature and logs why at startup, and a setup failure (Dirigera unreachable,
@@ -419,12 +419,39 @@ rounded to two decimals.
 
 ### Away mode
 
-The unit's lowest heat setpoint is 60°F, so 48°F can't be set. Away mode
-switches it instead: heat (toward 60°F) when the house falls to
-`THERMOSTAT_AWAY_TEMP_F − THERMOSTAT_AWAY_BAND_F` (47°F), off once it is back to
-`+ BAND` (49°F). Anything else running when away mode starts is switched off.
-The overnight preheat is suspended while away. Coming home restores the power,
-mode and setpoint the unit had when away mode started.
+The goal: keep the house from ever dropping below `THERMOSTAT_AWAY_MIN_F` (48°F)
+while buying as much of the heat as possible on off-peak power. It works in
+three layers, highest priority first:
+
+1. **Floor guard, any hour.** At 49°F or below it heats right away, peak or
+   not, until 51°F. Readings are whole degrees, so triggering at 49 is what
+   keeps the house from going under 48.
+2. **Bank, off-peak.** Each night it works out how warm the house must be at
+   07:00 to coast through the whole peak (07:00–23:00) and still be
+   `THERMOSTAT_AWAY_MARGIN_F` (2°F) above the floor at 23:00. It runs Newton's
+   law of cooling backwards through tomorrow's hourly forecast. Then it heats
+   to that **bank** as late in the night as the warm-up rate allows, the same
+   way the 64°F preheat is timed, and tops it up until 07:00. The bank never
+   goes above `THERMOSTAT_AWAY_MAX_BANK_F` (62°F). On a night that would need
+   more, the guard covers the gap during peak.
+3. **Coast, peak.** From 07:00 to 23:00 the unit stays off. Anything else
+   running is switched off.
+
+The unit's lowest heat setpoint is 60°F. When the bank target is below that,
+it heats toward 60 and cuts the power on reaching the target. When the target
+is above 60, the target is the setpoint. While away, the service owns the unit
+entirely, so leave it on any setting. The overnight 64°F preheat is suspended,
+and coming home restores the power, mode and setpoint the unit had when away
+mode started.
+
+**How fast the house loses heat** is learned like the warm-up rate. Every
+stretch of 3+ hours with the unit off, at least 8°F warmer inside than out, and
+a drop of 2°F or more gives a cooling constant `k`
+(`dT/dt = −k·(indoor − outdoor)`). The duration-weighted mean is used once
+there are two. Until then the prior is `k = 0.03/h`, a ~33-hour time constant
+that leans leaky, and `k` is scaled ×1.25 on top. With the prior, a 30°F day
+already calls for more than the 62°F cap, so expect the guard to run some
+during peak until real cool-downs are learned.
 
 Away mode is switched from the dashboard, or over the same listener as the
 meeting plug. These endpoints need no token: they're open to the home network

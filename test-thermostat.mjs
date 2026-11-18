@@ -9,6 +9,9 @@ import {
   preheatStart,
   planThermostat,
   meanForecast,
+  extractCooldowns,
+  fitCoolingModel,
+  awayBankTarget,
   DEFAULTS,
 } from "./thermostat.mjs";
 import { summarizeAcState } from "./thinq.mjs";
@@ -253,39 +256,150 @@ test("tick: no indoor reading -> do nothing", () => {
   assert.equal(planThermostat({ now: at(19, 3), device: dev(null), ratePerHour: 1 }).action, "idle");
 });
 
+// --- Cooling model -----------------------------------------------------------
+
+function cooling(start, k, { T0 = 64, tout = 30, hours = 6, extra = {} } = {}) {
+  // Exact Newton's-law readings every 5 min, rounded like the unit's.
+  return Array.from({ length: hours * 12 + 1 }, (_, i) => ({
+    t: start.getTime() + i * 5 * 60 * 1000,
+    power: false,
+    mode: "HEAT",
+    targetF: 64,
+    outdoorF: tout,
+    indoorF: Math.round(tout + (T0 - tout) * Math.exp(-k * (i / 12))),
+    ...extra,
+  }));
+}
+
+test("cooldowns: recovers k from an unheated stretch", () => {
+  const runs = extractCooldowns(cooling(at(18, 8), 0.02));
+  assert.equal(runs.length, 1);
+  assert.ok(Math.abs(runs[0].k - 0.02) < 0.005, `k=${runs[0].k}`);
+});
+
+test("cooldowns: heating, short, warm-outside and gappy stretches don't count", () => {
+  assert.equal(extractCooldowns(cooling(at(18, 8), 0.02, { extra: { power: true } })).length, 0);
+  assert.equal(extractCooldowns(cooling(at(18, 8), 0.02, { hours: 2 })).length, 0, "under 3 hours");
+  assert.equal(extractCooldowns(cooling(at(18, 8), 0.02, { tout: 60 })).length, 0, "outdoor too close to indoor");
+  const gappy = cooling(at(18, 8), 0.02).filter((_, i) => i % 6 === 0); // 30-min spacing
+  assert.equal(extractCooldowns(gappy).length, 0);
+});
+
+test("cooling model: prior until two cool-downs, then their weighted mean", () => {
+  assert.equal(fitCoolingModel([]).kind, "default");
+  assert.equal(fitCoolingModel([{ start: 0, end: 4 * 3600000, k: 0.02 }]).kind, "default");
+  const m = fitCoolingModel([{ start: 0, end: 4 * 3600000, k: 0.02 }, { start: 0, end: 4 * 3600000, k: 0.04 }]);
+  assert.equal(m.kind, "learned");
+  assert.ok(Math.abs(m.k - 0.03) < 1e-9);
+});
+
+test("bank target: backwards Newton's law through a flat forecast matches the closed form", () => {
+  const hourly = Array.from({ length: 72 }, (_, h) => ({ time: +at(19, 0) + h * 3600000, tempF: 30 }));
+  const T0 = awayBankTarget({ hourly, from: at(19, 7), to: at(19, 23), k: 0.02, endF: 50 });
+  assert.ok(Math.abs(T0 - (30 + 20 * Math.exp(0.02 * 16))) < 1e-9);
+});
+
+test("bank target: colder forecast or leakier house needs more banked", () => {
+  const flat = (f) => Array.from({ length: 72 }, (_, h) => ({ time: +at(19, 0) + h * 3600000, tempF: f }));
+  const args = { from: at(19, 7), to: at(19, 23), endF: 50 };
+  assert.ok(awayBankTarget({ ...args, hourly: flat(10), k: 0.02 }) > awayBankTarget({ ...args, hourly: flat(30), k: 0.02 }));
+  assert.ok(awayBankTarget({ ...args, hourly: flat(30), k: 0.03 }) > awayBankTarget({ ...args, hourly: flat(30), k: 0.02 }));
+  // A warm day needs nothing beyond the end temperature.
+  assert.ok(awayBankTarget({ ...args, hourly: flat(55), k: 0.02 }) < 50);
+  // No forecast -> the fallback outdoor temperature.
+  assert.equal(
+    awayBankTarget({ ...args, hourly: [], k: 0.02, fallbackOutdoorF: 30 }),
+    awayBankTarget({ ...args, hourly: flat(30), k: 0.02 })
+  );
+});
+
 // --- Away mode -----------------------------------------------------------------
 
-const away = (indoorF, extra = {}, state = {}) =>
-  planThermostat({ now: at(19, 3), device: dev(indoorF, extra), state: { away: true, ...state }, ratePerHour: 1 }).action;
+// A mild forecast with a tight house: bank target lands mid-50s, well under the 62 cap.
+const MILD = Array.from({ length: 96 }, (_, h) => ({ time: +at(18, 0) + h * 3600000, tempF: 40 }));
+const awayPlan = (now, indoorF, extra = {}, state = {}, more = {}) =>
+  planThermostat({
+    now,
+    device: dev(indoorF, extra),
+    state: { away: true, ...state },
+    ratePerHour: 1,
+    coolingK: 0.01,
+    hourly: MILD,
+    outdoorF: 40,
+    ...more,
+  });
 
-test("away: heats below 47, stops above 49", () => {
-  assert.equal(away(47), "away-heat-on");
-  assert.equal(away(46, { power: true }, { awayHeating: true }), "idle");
-  assert.equal(away(49, { power: true }, { awayHeating: true }), "away-heat-off");
-  assert.equal(away(55), "idle", "already off");
+test("away: bank target is what coasting the peak needs, with margin", () => {
+  const p = awayPlan(at(19, 1), 52);
+  // 40 + (50 - 40) * e^(0.0125 * 16) = 52.2 -> 53
+  assert.equal(p.bankF, 53);
+  assert.ok(Math.abs(p.requiredF - (40 + 10 * Math.exp(0.0125 * 16))) < 1e-9);
 });
 
-test("away: inside the band keeps an away heat run going (hysteresis)", () => {
-  assert.equal(away(48, { power: true }, { awayHeating: true }), "idle");
-  assert.equal(away(48), "idle");
+test("away: bank is capped, and never below the guard's off point", () => {
+  const cold = Array.from({ length: 96 }, (_, h) => ({ time: +at(18, 0) + h * 3600000, tempF: 0 }));
+  assert.equal(awayPlan(at(19, 1), 55, {}, {}, { hourly: cold, coolingK: 0.05 }).bankF, DEFAULTS.awayMaxBankF);
+  const warm = Array.from({ length: 96 }, (_, h) => ({ time: +at(18, 0) + h * 3600000, tempF: 60 }));
+  assert.equal(awayPlan(at(19, 1), 55, {}, {}, { hourly: warm }).bankF, DEFAULTS.awayMinF + 3);
 });
 
-test("away: switches off anything it didn't start", () => {
-  assert.equal(away(48, { power: true }), "away-heat-off", "a heat run left on from before");
-  assert.equal(away(48, { power: true, mode: "COOL" }, { awayHeating: true }), "away-heat-off");
-  assert.equal(away(60, { power: true, mode: "COOL" }), "away-heat-off");
+test("away: banks off-peak from the start time, as late as the warm-up allows", () => {
+  // Bank 53, from 50 at 1°F/h: 3h * 1.2 + 15min = 231 min before 07:00 -> 03:09.
+  const before = awayPlan(at(19, 3), 50);
+  assert.equal(before.action, "idle");
+  assert.equal(hhmm(before.startAt), "03:09");
+  const go = awayPlan(at(19, 3, 10), 50);
+  assert.equal(go.action, "away-heat-on");
+  assert.equal(go.run, "bank");
+  assert.equal(go.setpointF, 60, "below the unit's 60°F floor -> heat toward 60, cut at the bank");
 });
 
-test("away: below the band, a non-heat mode is replaced by heat", () => {
-  assert.equal(away(45, { power: true, mode: "COOL" }, { awayHeating: true }), "away-heat-on");
+test("away: a bank above 60 uses the bank as the setpoint", () => {
+  const cold = Array.from({ length: 96 }, (_, h) => ({ time: +at(18, 0) + h * 3600000, tempF: 20 }));
+  const p = awayPlan(at(19, 6), 55, {}, {}, { hourly: cold, coolingK: 0.02 });
+  assert.equal(p.action, "away-heat-on");
+  assert.equal(p.setpointF, p.bankF);
+  assert.ok(p.bankF > 60);
 });
 
-test("away: suppresses the overnight preheat", () => {
-  assert.equal(away(55), "idle");
+test("away: switches off once banked, holds the bank with 1°F hysteresis", () => {
+  assert.equal(awayPlan(at(19, 5), 53, { power: true }, { awayHeating: true, awayRun: "bank" }).action, "away-heat-off");
+  assert.equal(awayPlan(at(19, 5), 52, { power: true }, { awayHeating: true, awayRun: "bank" }).action, "idle", "still banking");
+  // Dropped a degree after banking: top up, again as late as possible (1°F -> 05:33).
+  assert.equal(awayPlan(at(19, 5), 52).action, "idle");
+  assert.equal(awayPlan(at(19, 5, 35), 52).action, "away-heat-on");
+  assert.equal(awayPlan(at(19, 6, 30), 53).action, "idle", "at the bank, off");
 });
 
-test("away: no reading -> do nothing", () => {
-  assert.equal(away(null), "idle");
+test("away: coasts through peak -- a bank run is cut at 07:00", () => {
+  assert.equal(awayPlan(at(19, 7), 52, { power: true }, { awayHeating: true, awayRun: "bank" }).action, "away-heat-off");
+  assert.equal(awayPlan(at(19, 14), 52).action, "idle");
+  assert.equal(awayPlan(at(19, 14), 52, { power: true, mode: "COOL" }).action, "away-heat-off", "nothing else may run");
+});
+
+test("away: floor guard heats at 49 at any hour, until 51", () => {
+  const p = awayPlan(at(19, 14), 49);
+  assert.equal(p.action, "away-heat-on");
+  assert.equal(p.run, "guard");
+  assert.equal(p.setpointF, 60);
+  assert.equal(awayPlan(at(19, 14), 50, { power: true }, { awayHeating: true, awayRun: "guard" }).action, "idle", "keeps going");
+  assert.equal(awayPlan(at(19, 14), 51, { power: true }, { awayHeating: true, awayRun: "guard" }).action, "away-heat-off");
+  assert.equal(awayPlan(at(19, 14), 50).action, "idle", "50 alone doesn't start one");
+});
+
+test("away: a guard run during the bank is taken over by the bank", () => {
+  const p = awayPlan(at(19, 4, 30), 51, { power: true }, { awayHeating: true, awayRun: "guard" });
+  assert.equal(p.action, "away-heat-on");
+  assert.equal(p.run, "bank");
+});
+
+test("away: replaces a non-heat mode when the floor needs heat", () => {
+  assert.equal(awayPlan(at(19, 14), 48, { power: true, mode: "COOL" }, { awayHeating: true }).action, "away-heat-on");
+});
+
+test("away: suppresses the overnight preheat, and no reading -> nothing", () => {
+  assert.notEqual(awayPlan(at(19, 3), 60).action, "preheat");
+  assert.equal(awayPlan(at(19, 3), null).action, "idle");
 });
 
 // --- Forecast + state parsing ----------------------------------------------------

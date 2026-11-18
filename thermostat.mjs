@@ -14,10 +14,15 @@
  *   worked back from how fast the house warms, learned from past heating runs
  *   at similar outdoor temperatures.
  *
- *   Away mode. Holds the house near 48°F. The unit's lowest heat setpoint is
- *   60°F, so 48 can't simply be set; instead the unit is switched on (heating
- *   toward its floor) when the house falls below the band and off when it
- *   climbs back above it.
+ *   Away mode. Keeps the house above 48°F while buying as much of the heat as
+ *   possible off-peak. Each night it banks heat: it works out how warm the
+ *   house has to be at the end of off-peak to coast through the whole peak
+ *   period above the floor -- from tomorrow's forecast and how fast the house
+ *   loses heat, learned from the history -- and heats to that as late in the
+ *   window as the warm-up rate allows. Through the peak the unit stays off,
+ *   except for a floor guard that heats at any hour if the house gets close
+ *   to 48. The unit's lowest heat setpoint is 60°F, so a bank target below
+ *   that is reached by heating toward 60 and switching off on arrival.
  *
  * Temperatures are °F. Times are local.
  */
@@ -41,11 +46,25 @@ export const DEFAULTS = {
   /** Multiplier on the predicted warm-up time, then a fixed cushion on top. */
   safety: 1.2,
   marginMinutes: 15,
-  awayF: 48,
-  /** Away heats below awayF - band and stops above awayF + band. */
-  awayBandF: 1,
   minRatePerHour: 0.25,
   maxRatePerHour: 8,
+
+  /** Away: the house never goes below this. */
+  awayMinF: 48,
+  /** Away: the bank aims to still be this far above the floor when peak ends. */
+  awayMarginF: 2,
+  /** Away: never bank above this, however cold the forecast. */
+  awayMaxBankF: 62,
+  /**
+   * Heat loss, Newton's law: dT/dt = -k (indoor - outdoor), k per hour. The
+   * prior (a ~33-hour time constant) is used until cool-downs are learned; it
+   * leans leaky, so early nights bank more, not less. coolingSafety scales k
+   * up on top of that.
+   */
+  defaultCoolingK: 0.03,
+  coolingSafety: 1.25,
+  minCoolingK: 0.005,
+  maxCoolingK: 0.2,
 };
 
 // --- Off-peak window ---------------------------------------------------------
@@ -200,6 +219,86 @@ export function fitWarmupModel(runs, opts = {}) {
   };
 }
 
+// --- Learning how fast the house cools ----------------------------------------
+
+/**
+ * Pull cool-downs out of the sample history: stretches of 3+ hours with the
+ * unit off, the outdoor temperature known and well below indoor, and a drop of
+ * at least 2°F (readings are whole degrees). Each gives a Newton's-law k:
+ *
+ *   k = ln((T0 - Tout) / (T1 - Tout)) / hours,  Tout = mean outdoor
+ *
+ * Daytime stretches include some solar gain, which reads as a slower loss.
+ * That errs toward banking too little, which the floor guard covers.
+ */
+export function extractCooldowns(samples, { maxGapMs = 20 * 60 * 1000, minMinutes = 180, minDropF = 2, minDeltaF = 8 } = {}) {
+  const runs = [];
+  let seg = [];
+  const usable = (s) => !s.power && Number.isFinite(s.indoorF) && Number.isFinite(s.outdoorF) && s.indoorF - s.outdoorF >= minDeltaF;
+
+  const close = () => {
+    if (seg.length >= 2) {
+      const a = seg[0];
+      const b = seg[seg.length - 1];
+      const hours = (time(b) - time(a)) / MS_PER_HOUR;
+      const tout = seg.reduce((acc, s) => acc + s.outdoorF, 0) / seg.length;
+      if (hours * 60 >= minMinutes && a.indoorF - b.indoorF >= minDropF && b.indoorF - tout > 1) {
+        runs.push({ start: time(a), end: time(b), startF: a.indoorF, endF: b.indoorF, outdoorF: tout, k: Math.log((a.indoorF - tout) / (b.indoorF - tout)) / hours });
+      }
+    }
+    seg = [];
+  };
+
+  for (const s of samples) {
+    const prev = seg[seg.length - 1];
+    if (!usable(s) || (prev && time(s) - time(prev) > maxGapMs)) close();
+    if (usable(s)) seg.push(s);
+  }
+  close();
+  return runs;
+}
+
+/** Duration-weighted mean k of the learned cool-downs, or the prior until there are two. */
+export function fitCoolingModel(runs, opts = {}) {
+  const o = { ...DEFAULTS, ...opts };
+  const clamp = (k) => Math.min(o.maxCoolingK, Math.max(o.minCoolingK, k));
+  const usable = runs.filter((r) => Number.isFinite(r.k) && r.k > 0).slice(-(o.maxRuns ?? 60));
+  if (usable.length < 2) {
+    return { kind: "default", n: usable.length, k: clamp(o.defaultCoolingK), describe: `prior k=${o.defaultCoolingK}/h (~${Math.round(1 / o.defaultCoolingK)}h time constant)` };
+  }
+  const w = (r) => (r.end - r.start) / MS_PER_HOUR;
+  const k = clamp(usable.reduce((a, r) => a + r.k * w(r), 0) / usable.reduce((a, r) => a + w(r), 0));
+  return { kind: "learned", n: usable.length, k, describe: `k=${k.toFixed(3)}/h (~${Math.round(1 / k)}h time constant) from ${usable.length} cool-downs` };
+}
+
+/** Forecast temperature at time t: the nearest hour, else the fallback. */
+function outdoorAt(hourly, t, fallbackF) {
+  if (!hourly?.length) return fallbackF;
+  let best = null;
+  for (const h of hourly) {
+    if (!Number.isFinite(h.tempF)) continue;
+    if (!best || Math.abs(+new Date(h.time) - t) < Math.abs(+new Date(best.time) - t)) best = h;
+  }
+  // A forecast that doesn't reach this far is no forecast for it.
+  return best && Math.abs(+new Date(best.time) - t) <= 3 * MS_PER_HOUR ? best.tempF : fallbackF;
+}
+
+/**
+ * How warm the house must be at `from` to still be `endF` at `to` with the
+ * unit off: Newton's law run backwards, an hour at a time, through the hourly
+ * forecast. Hours the forecast doesn't cover use fallbackOutdoorF.
+ */
+export function awayBankTarget({ hourly, from, to, k, endF, fallbackOutdoorF = DEFAULTS.refOutdoorF }) {
+  let T = endF;
+  for (let t = +to; t > +from; ) {
+    const step = Math.min(MS_PER_HOUR, t - +from);
+    const tout = outdoorAt(hourly, t - step / 2, fallbackOutdoorF);
+    T = tout + (T - tout) * Math.exp((k * step) / MS_PER_HOUR);
+    t -= step;
+  }
+  return T;
+}
+
 // --- Preheat -----------------------------------------------------------------
 
 /**
@@ -244,18 +343,20 @@ export function preheatStart({
  * Decide what the periodic tick should do.
  *
  * `device` is summarizeAcState()'s output. `state` is the persisted
- * { preheatKey, away, awayHeating }.
+ * { preheatKey, away, awayHeating, awayRun }. `coolingK`, `hourly` (the
+ * forecast) and `outdoorF` only matter in away mode.
  *
  * Preheat fires once per night (state.preheatKey = that night's window key),
  * so changing the thermostat by hand after it starts sticks, and a restart
  * mid-preheat doesn't re-send anything.
  *
- * @returns {{action: "idle"|"preheat"|"preheat-skip"|"away-heat-on"|"away-heat-off", reason: string, startAt?: Date, minutesNeeded?: number, key?: string}}
+ * @returns {{action: "idle"|"preheat"|"preheat-skip"|"away-heat-on"|"away-heat-off", reason: string, startAt?: Date,
+ *   minutesNeeded?: number, key?: string, run?: "bank"|"guard", setpointF?: number, bankF?: number, requiredF?: number}}
  */
-export function planThermostat({ now, device, state = {}, ratePerHour, opts = {} }) {
+export function planThermostat({ now, device, state = {}, ratePerHour, coolingK = DEFAULTS.defaultCoolingK, hourly = [], outdoorF = null, opts = {} }) {
   const o = { ...DEFAULTS, ...opts };
 
-  if (state.away) return planAway({ device, state, o });
+  if (state.away) return planAway({ now, device, state, ratePerHour, coolingK, hourly, outdoorF, o });
 
   const window = offPeakWindow(now, o.windowStart, o.windowEnd);
   if (!window.inWindow) return { action: "idle", reason: "outside the off-peak window" };
@@ -285,31 +386,76 @@ export function planThermostat({ now, device, state = {}, ratePerHour, opts = {}
 }
 
 /**
- * Away mode: a bang-bang controller around awayF with hysteresis.
+ * Away mode, in priority order:
  *
- * It owns the unit while away. Anything running that it didn't start (cooling,
- * a heat run left on) is switched off once the house is warm enough not to need
- * it. With no reading it does nothing rather than guess.
+ *   1. Floor guard (any hour): at awayMinF + 1 or below, heat until
+ *      awayMinF + 3. Readings are whole degrees, so this is what keeps the
+ *      house from going under awayMinF.
+ *   2. Bank (off-peak, from the start time): heat to bankF -- enough to coast
+ *      through the coming peak and end it awayMarginF above the floor -- and
+ *      hold it there until off-peak ends.
+ *   3. Coast (peak, and off-peak before the start time): the unit stays off.
+ *      Anything running that isn't an unfinished guard run is switched off.
+ *
+ * It owns the unit while away. With no reading it does nothing rather than guess.
  */
-function planAway({ device, state, o }) {
-  if (!Number.isFinite(device?.indoorF)) return { action: "idle", reason: "away: no indoor reading" };
-  const low = o.awayF - o.awayBandF;
-  const high = o.awayF + o.awayBandF;
-  const heatingNow = device.power && device.mode === "HEAT";
+function planAway({ now, device, state, ratePerHour, coolingK, hourly, outdoorF, o }) {
+  const T = device?.indoorF;
+  if (!Number.isFinite(T)) return { action: "idle", reason: "away: no indoor reading" };
 
-  if (device.indoorF <= low) {
-    if (heatingNow && state.awayHeating) return { action: "idle", reason: `away: heating (${device.indoorF}°F)` };
-    return { action: "away-heat-on", reason: `away: ${device.indoorF}°F <= ${low}°F` };
+  const heatingNow = device.power && device.mode === "HEAT";
+  const ours = heatingNow && !!state.awayHeating;
+  const run = ours ? state.awayRun || "guard" : null;
+  const guardOn = o.awayMinF + 1;
+  const guardOff = o.awayMinF + 3;
+  const setpoint = (f) => Math.min(86, Math.max(device.minTargetF ?? 60, Math.ceil(f)));
+
+  // The window we're in, or the next one; the peak it has to carry the house through follows it.
+  const window = offPeakWindow(now, o.windowStart, o.windowEnd);
+  const peakEnd = offPeakWindow(window.end, o.windowStart, o.windowEnd).start;
+  const requiredF = awayBankTarget({
+    hourly,
+    from: window.end,
+    to: peakEnd,
+    k: coolingK * o.coolingSafety,
+    endF: o.awayMinF + o.awayMarginF,
+    fallbackOutdoorF: Number.isFinite(outdoorF) ? outdoorF : o.refOutdoorF,
+  });
+  const bankF = Math.min(o.awayMaxBankF, Math.max(guardOff, Math.ceil(requiredF)));
+  const { startAt, minutesNeeded } = preheatStart({
+    indoorF: T,
+    ratePerHour,
+    window,
+    targetF: bankF,
+    safety: o.safety,
+    marginMinutes: o.marginMinutes,
+    latestStart: o.latestStart,
+  });
+  const plan = { bankF, requiredF, startAt, minutesNeeded, key: window.key };
+  const on = (runKind, target, reason) => ({ ...plan, action: "away-heat-on", run: runKind, setpointF: setpoint(target), reason });
+  const off = (reason) => ({ ...plan, action: "away-heat-off", reason });
+  const idle = (reason) => ({ ...plan, action: "idle", reason });
+
+  // 1. Floor guard.
+  if (T <= guardOn) {
+    if (ours) return idle(`away: ${run === "bank" ? "banking" : "guard heating"} (${T}°F)`);
+    return on("guard", guardOff, `away: ${T}°F, at the ${o.awayMinF}°F floor guard -- heating now`);
   }
-  if (device.indoorF >= high) {
-    if (!device.power) return { action: "idle", reason: `away: off (${device.indoorF}°F)` };
-    return { action: "away-heat-off", reason: `away: ${device.indoorF}°F >= ${high}°F` };
+
+  // 2. Bank. A bank run under way keeps going: its start time, re-worked from a
+  // house it has already warmed, has moved later than now.
+  if (window.inWindow && (now >= startAt || run === "bank")) {
+    if (T >= bankF) return device.power ? off(`away: banked ${T}°F (target ${bankF}°F)`) : idle(`away: banked (${T}°F)`);
+    if (ours && run === "bank") return idle(`away: banking ${T}°F -> ${bankF}°F`);
+    // Start the bank below it -- or take over a guard run so it goes on to the bank target.
+    if (T <= bankF - 1 || ours) return on("bank", bankF, `away: banking ${T}°F -> ${bankF}°F by ${o.windowEnd}`);
+    return idle(`away: holding the bank (${T}°F)`);
   }
-  // Inside the band: keep heating if we are, but nothing else may run.
-  if (device.power && !(heatingNow && state.awayHeating)) {
-    return { action: "away-heat-off", reason: `away: unit on but not an away heat run (${device.indoorF}°F)` };
-  }
-  return { action: "idle", reason: `away: holding (${device.indoorF}°F)` };
+
+  // 3. Coast.
+  if (run === "guard" && T < guardOff) return idle(`away: guard heating (${T}°F -> ${guardOff}°F)`);
+  if (device.power) return off(`away: coasting -- ${window.inWindow ? "bank starts later" : "peak hours"} (${T}°F)`);
+  return idle(`away: coasting (${T}°F, bank ${bankF}°F ${window.inWindow ? "from" : "after"} ${window.inWindow ? "the start time" : o.windowStart})`);
 }
 
 // --- Outdoor forecast --------------------------------------------------------

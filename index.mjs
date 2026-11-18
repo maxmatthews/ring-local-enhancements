@@ -28,7 +28,16 @@ import { holdOpenReason } from "./blind-holds.mjs";
 import { createGoveeClient } from "./govee.mjs";
 import { pickScene, planLights, localDateKey, timeOnDay, DEFAULT_SCENE, DEFAULT_LEAD_DAYS } from "./govee-lights.mjs";
 import { createThinqClient, summarizeAcState, acCommands } from "./thinq.mjs";
-import { offPeakWindow, extractWarmups, fitWarmupModel, planThermostat, meanForecast, DEFAULTS as THERMOSTAT_DEFAULTS } from "./thermostat.mjs";
+import {
+  offPeakWindow,
+  extractWarmups,
+  fitWarmupModel,
+  extractCooldowns,
+  fitCoolingModel,
+  planThermostat,
+  meanForecast,
+  DEFAULTS as THERMOSTAT_DEFAULTS,
+} from "./thermostat.mjs";
 import { fetchOutdoor } from "./weather.mjs";
 import { createLevitonClient, findBreaker } from "./leviton.mjs";
 import SunCalc from "suncalc";
@@ -153,8 +162,9 @@ const THERMOSTAT_OPTS = {
   safety: num("THERMOSTAT_PREHEAT_SAFETY", THERMOSTAT_DEFAULTS.safety),
   marginMinutes: num("THERMOSTAT_PREHEAT_MARGIN_MINUTES", THERMOSTAT_DEFAULTS.marginMinutes),
   defaultRatePerHour: num("THERMOSTAT_DEFAULT_RATE_F_PER_HOUR", THERMOSTAT_DEFAULTS.defaultRatePerHour),
-  awayF: num("THERMOSTAT_AWAY_TEMP_F", THERMOSTAT_DEFAULTS.awayF),
-  awayBandF: num("THERMOSTAT_AWAY_BAND_F", THERMOSTAT_DEFAULTS.awayBandF),
+  awayMinF: num("THERMOSTAT_AWAY_MIN_F", num("THERMOSTAT_AWAY_TEMP_F", THERMOSTAT_DEFAULTS.awayMinF)),
+  awayMarginF: num("THERMOSTAT_AWAY_MARGIN_F", THERMOSTAT_DEFAULTS.awayMarginF),
+  awayMaxBankF: num("THERMOSTAT_AWAY_MAX_BANK_F", THERMOSTAT_DEFAULTS.awayMaxBankF),
 };
 const THERMOSTAT_TICK_MS = parseInt(process.env.THERMOSTAT_TICK_MS || "300000", 10);
 // Until a warm-up has been learned, start no later than this (the hand-run
@@ -1865,6 +1875,10 @@ async function thermostatHeatTo(device, targetF) {
   if (device.targetF !== targetF) await thinq.control(thermostatDeviceId, acCommands.heatTargetF(targetF));
 }
 
+function thermostatCoolingModel() {
+  return fitCoolingModel(extractCooldowns(thermostatHistory), THERMOSTAT_OPTS);
+}
+
 function thermostatModel() {
   return fitWarmupModel(extractWarmups(thermostatHistory), THERMOSTAT_OPTS);
 }
@@ -1887,11 +1901,38 @@ async function thermostatTick() {
     const ratePerHour = model.rateAt(forecastF ?? outdoor?.nowF ?? null);
     const state = THERMOSTAT_PREHEAT_ENABLED || thermostatState.away ? thermostatState : { ...thermostatState, preheatKey: window.key };
     const latestStart = model.kind === "default" && THERMOSTAT_PREHEAT_LATEST_START ? THERMOSTAT_PREHEAT_LATEST_START : null;
-    const plan = planThermostat({ now, device, state, ratePerHour, opts: { ...THERMOSTAT_OPTS, latestStart } });
-    thermostatLast = { at: now.toISOString(), device, outdoorF: outdoor?.nowF ?? null, forecastF, ratePerHour, model: model.describe, plan };
+    const cooling = thermostatCoolingModel();
+    const plan = planThermostat({
+      now,
+      device,
+      state,
+      ratePerHour,
+      coolingK: cooling.k,
+      hourly: outdoor?.hourly ?? [],
+      outdoorF: outdoor?.nowF ?? null,
+      opts: { ...THERMOSTAT_OPTS, latestStart },
+    });
+    thermostatLast = {
+      at: now.toISOString(),
+      device,
+      outdoorF: outdoor?.nowF ?? null,
+      forecastF,
+      ratePerHour,
+      model: model.describe,
+      coolingModel: cooling.describe,
+      plan,
+    };
 
-    if (plan.startAt && thermostatAnnouncedKey !== plan.key) {
-      thermostatAnnouncedKey = plan.key;
+    const announceKey = `${thermostatState.away ? "away" : "home"}:${plan.key}`;
+    if (plan.startAt && thermostatState.away && thermostatAnnouncedKey !== announceKey) {
+      thermostatAnnouncedKey = announceKey;
+      log(
+        `Thermostat: away -- bank to ${plan.bankF}°F by ${THERMOSTAT_OPTS.windowEnd} (coasting the peak needs ` +
+          `${plan.requiredF.toFixed(1)}°F${plan.requiredF > plan.bankF ? `, capped at ${plan.bankF}°F` : ""}), ` +
+          `expected ~${plan.startAt.toLocaleTimeString()}; floor ${THERMOSTAT_OPTS.awayMinF}°F -- ${cooling.describe}`
+      );
+    } else if (plan.startAt && thermostatAnnouncedKey !== announceKey) {
+      thermostatAnnouncedKey = announceKey;
       log(
         `Thermostat: preheat to ${THERMOSTAT_OPTS.targetF}°F expected ~${plan.startAt.toLocaleTimeString()} ` +
           `(${device.indoorF}°F inside, ${forecastF?.toFixed(0) ?? "?"}°F forecast, ${ratePerHour.toFixed(2)}°F/h -- ${model.describe}` +
@@ -1910,14 +1951,14 @@ async function thermostatTick() {
         log(`Thermostat: preheat not needed -- ${plan.reason}`);
         break;
       case "away-heat-on":
-        // Heat toward the unit's floor; we switch it off long before it gets there.
-        await thermostatHeatTo(device, device.minTargetF ?? 60);
-        thermostatState = { ...thermostatState, awayHeating: true };
-        log(`Thermostat: ${plan.reason} -- heating`);
+        // Below 60°F the setpoint is the unit's floor and we cut the run on arrival.
+        await thermostatHeatTo(device, plan.setpointF);
+        thermostatState = { ...thermostatState, awayHeating: true, awayRun: plan.run };
+        log(`Thermostat: ${plan.reason} -- heating (setpoint ${plan.setpointF}°F, ${plan.run} run)`);
         break;
       case "away-heat-off":
         await thinq.control(thermostatDeviceId, acCommands.power(false));
-        thermostatState = { ...thermostatState, awayHeating: false };
+        thermostatState = { ...thermostatState, awayHeating: false, awayRun: null };
         log(`Thermostat: ${plan.reason} -- off`);
         break;
       default:
@@ -1949,15 +1990,16 @@ async function setThermostatAway(away) {
       awaySince: new Date().toISOString(),
       awaySnapshot: { power: device.power, mode: device.mode, targetF: device.targetF },
       awayHeating: false,
+      awayRun: null,
     };
     saveThermostatState();
-    log(`Thermostat: away mode on -- holding ~${THERMOSTAT_OPTS.awayF}°F (was ${device.power ? `${device.mode} ${device.targetF}°F` : "off"})`);
+    log(`Thermostat: away mode on -- never below ${THERMOSTAT_OPTS.awayMinF}°F, heat banked off-peak (was ${device.power ? `${device.mode} ${device.targetF}°F` : "off"})`);
     runThermostatTickSoon(); // switches off whatever is running, or starts heat if already cold
     return { changed: true, device };
   }
 
   const snap = thermostatState.awaySnapshot;
-  thermostatState = { ...thermostatState, away: false, awaySince: null, awaySnapshot: null, awayHeating: false };
+  thermostatState = { ...thermostatState, away: false, awaySince: null, awaySnapshot: null, awayHeating: false, awayRun: null };
   saveThermostatState();
   try {
     if (snap?.power) {
@@ -2133,7 +2175,7 @@ function startThermostat() {
   thermostatState = loadThermostatState();
   thermostatHistory = loadThermostatHistory();
   const model = thermostatModel();
-  log(`  Thermostat: ${thermostatHistory.length} samples, warm-up model: ${model.describe}`);
+  log(`  Thermostat: ${thermostatHistory.length} samples, warm-up model: ${model.describe}; cooling: ${thermostatCoolingModel().describe}`);
   if (thermostatState.away) log(`  Thermostat: in away mode since ${thermostatState.awaySince}`);
 
   thermostatTickTimer = setInterval(() => {
@@ -2202,7 +2244,7 @@ async function main() {
       if (THERMOSTAT_PREHEAT_LATEST_START) offPeakWindow(new Date(), THERMOSTAT_PREHEAT_LATEST_START, THERMOSTAT_OPTS.windowEnd);
       log(
         `  Thermostat: "${THERMOSTAT_DEVICE_NAME}" | preheat ${THERMOSTAT_PREHEAT_ENABLED ? `to ${THERMOSTAT_OPTS.targetF}°F by ${THERMOSTAT_OPTS.windowEnd} ` +
-          `(off-peak from ${THERMOSTAT_OPTS.windowStart})` : "off"} | away holds ~${THERMOSTAT_OPTS.awayF}°F | ` +
+          `(off-peak from ${THERMOSTAT_OPTS.windowStart})` : "off"} | away never below ${THERMOSTAT_OPTS.awayMinF}°F | ` +
           `outdoor temps ${Number.isFinite(LATITUDE) && Number.isFinite(LONGITUDE) ? "on" : "off (no LATITUDE / LONGITUDE)"}`
       );
       startThermostat();

@@ -1,6 +1,6 @@
 /**
  * Outdoor temperature from Open-Meteo (https://open-meteo.com): free, no API
- * key. Current temperature plus a two-day hourly forecast, in °F.
+ * key. Current temperature plus a three-day hourly forecast, in °F.
  *
  * Coordinates are rounded to two decimals (about 1 km) before they leave the
  * house -- plenty for weather, and no more precise than it needs to be.
@@ -16,7 +16,7 @@ export async function fetchOutdoor({ latitude, longitude }) {
     current: "temperature_2m",
     hourly: "temperature_2m",
     temperature_unit: "fahrenheit",
-    forecast_days: "2",
+    forecast_days: "3", // tomorrow's whole peak, seen from tonight
     timezone: "UTC",
   }).toString();
   const res = await fetch(url, { signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS) });
