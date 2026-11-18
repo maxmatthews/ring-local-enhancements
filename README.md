@@ -426,8 +426,12 @@ switches it instead: heat (toward 60°F) when the house falls to
 The overnight preheat is suspended while away. Coming home restores the power,
 mode and setpoint the unit had when away mode started.
 
-Away mode is switched over the same listener as the meeting plug, with the same
-`MEETING_PLUG_TOKEN`s:
+Away mode is switched from the dashboard, or over the same listener as the
+meeting plug. These endpoints need no token: they're open to the home network
+by choice. Writes must carry an `X-Requested-By` header, and if the request
+says where it came from, it must be this host. That stops a web page elsewhere
+from switching the heat through your browser, since a cross-site page can't add
+the header.
 
 | Method | Path | Purpose |
 | --- | --- | --- |
@@ -436,13 +440,13 @@ Away mode is switched over the same listener as the meeting plug, with the same
 | `GET` | `/thermostat/status` | Away state, last reading, outdoor/forecast temps, predicted rate and model, recent learned runs |
 
 ```sh
-curl -X POST -H "Authorization: Bearer $TOKEN" http://pi.local:8787/thermostat/away
+curl -X POST -H "X-Requested-By: me" http://pi.local:8787/thermostat/away
 ```
 
 ### Dashboard
 
-`http://pi.local:8787/dashboard` (also `/`) on the home network. The page asks
-once for a `MEETING_PLUG_TOKEN` and keeps it in that browser. It shows:
+`http://pi.local:8787/dashboard` (also `/`) on the home network. No token. It
+shows:
 
 - indoor and outdoor temperature, what the unit is doing, and the heat pump's
   draw from the Leviton breaker
@@ -453,9 +457,8 @@ once for a `MEETING_PLUG_TOKEN` and keeps it in that browser. It shows:
 - every learned warm-up run
 - an Away / I'm home switch
 
-It refreshes every minute. The page holds no data and is served without a
-token. Everything else comes from `GET /thermostat/status` and
-`GET /thermostat/history?hours=N`, both behind the token.
+It refreshes every minute. Its data comes from `GET /thermostat/status` and
+`GET /thermostat/history?hours=N`.
 
 **Leviton is read-only.** `leviton.mjs` signs in with `LEVITON_EMAIL` /
 `LEVITON_PASSWORD` and only reads; it never writes to the panel or switches a

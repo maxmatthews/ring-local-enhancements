@@ -247,9 +247,9 @@ const goveeLightsEnabled = !!(GOVEE_API_KEY && Number.isFinite(LATITUDE) && Numb
 // but isn't required: without it the model just can't adjust for the weather.
 const thermostatEnabled = !!THINQ_PAT;
 const levitonEnabled = !!(thermostatEnabled && LEVITON_EMAIL && LEVITON_PASSWORD);
-// One listener serves the meeting plug and the thermostat's away switch, behind
-// the same bearer tokens. No tokens, no listener.
-const httpServerEnabled = MEETING_PLUG_TOKENS.length > 0 && (meetingPlugServerEnabled || thermostatEnabled);
+// One listener serves the meeting plug (behind its bearer tokens) and the
+// thermostat dashboard + API (open on the LAN, by choice).
+const httpServerEnabled = meetingPlugServerEnabled || thermostatEnabled;
 // One SmartThings client serves both features. Two would fight: refresh tokens
 // rotate on every use, so a second client would invalidate the first one's.
 const smartThingsEnabled = smokeUnlockEnabled || meetingPlugServerEnabled;
@@ -1578,19 +1578,40 @@ function startMeetingPlugServer(stClient) {
   meetingTick().catch((err) => logError("Meeting-plug catch-up tick failed", err));
 }
 
-// One listener for every HTTP-driven feature: /thermostat/* goes to the
-// thermostat, everything else to the meeting plug. Same tokens for both.
+// One listener for every HTTP-driven feature: the dashboard and /thermostat/*
+// are open to the LAN; everything else is the meeting plug, behind its tokens.
 // Started before the Ring connection so the away switch works even while the
 // alarm hub is slow to answer.
+/**
+ * A write from our own page, not a cross-site request riding the browser.
+ * Another site can't add a custom header without a CORS preflight, which this
+ * server never approves; and if the browser says where the request came from,
+ * it must be this host. curl works by adding the header.
+ */
+function sameOriginWrite(req) {
+  if (!req.headers["x-requested-by"]) return false;
+  const origin = req.headers.origin;
+  if (!origin) return true;
+  try {
+    return new URL(origin).host === req.headers.host;
+  } catch (_) {
+    return false;
+  }
+}
+
 function startHttpServer() {
   httpServer = createServer((req, res) => {
     const path = new URL(req.url, "http://localhost").pathname.replace(/\/+$/, "") || "/";
     const handle = async () => {
-      // The page itself holds no data, so it's served without a token; it asks
-      // for one and sends it on every data request.
       if (req.method === "GET" && (path === "/" || path === "/dashboard")) return serveDashboard(res);
+      // Open on the LAN -- no token. Writes still have to come from the
+      // dashboard itself, so a web page elsewhere can't switch the heat off
+      // through your browser.
+      if (path === "/thermostat" || path.startsWith("/thermostat/")) {
+        if (req.method !== "GET" && !sameOriginWrite(req)) return sendJson(res, 403, { error: "writes must come from the dashboard (X-Requested-By header, same origin)" });
+        return handleThermostatRequest(req, res, path);
+      }
       if (!meetingAuthOk(req)) return sendJson(res, 401, { error: "unauthorized" });
-      if (path === "/thermostat" || path.startsWith("/thermostat/")) return handleThermostatRequest(req, res, path);
       return handleMeetingRequest(req, res, path);
     };
     handle().catch((err) => {
@@ -2192,7 +2213,6 @@ async function main() {
     log("  Thermostat disabled (missing THINQ_PAT)");
   }
   if (httpServerEnabled) startHttpServer();
-  else if (thermostatEnabled) log("  Thermostat: no MEETING_PLUG_TOKEN set -- the away switch (HTTP) is unavailable");
 
   const ringApi = new RingApi({
     refreshToken: REFRESH_TOKEN,

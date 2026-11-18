@@ -103,8 +103,6 @@
   th { color: var(--text-2); font-weight: 600; font-size: 13px; }
   details summary { cursor: pointer; color: var(--text-2); font-size: 13px; margin-top: 8px; }
   .scroll { overflow-x: auto; max-height: 320px; overflow-y: auto; }
-  .gate { max-width: 420px; margin: 12vh auto; }
-  .gate input { width: 100%; font: inherit; padding: 8px 10px; border-radius: 8px; border: 1px solid var(--border); background: var(--bg); color: var(--text); margin: 8px 0 12px; }
   .err { color: var(--critical); font-size: 13px; }
   .totals { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; margin-top: 12px; }
   .totals div { font-size: 13px; color: var(--text-2); }
@@ -117,9 +115,9 @@
 
 <script>
 "use strict";
-// Served by the Pi. Data comes from /thermostat/* with the same bearer token as
-// the meeting plug; the token is kept in this browser only.
-const TOKEN_KEY = "heatpump-dashboard-token";
+// Served by the Pi; the data comes from /thermostat/* on the same host. Open on
+// the home network -- no token. Writes carry X-Requested-By, which the Pi
+// requires so another site can't switch the heat through this browser.
 const RANGE_KEY = "heatpump-dashboard-range";
 const REFRESH_MS = 60 * 1000;
 const app = document.getElementById("app");
@@ -129,8 +127,8 @@ const store = {
   set(k, v) { try { localStorage.setItem(k, v); } catch {} },
   del(k) { try { localStorage.removeItem(k); } catch {} },
 };
+store.del("heatpump-dashboard-token"); // left over from when the page asked for one
 
-let token = store.get(TOKEN_KEY);
 let rangeHours = parseInt(store.get(RANGE_KEY) || "48", 10);
 let status = null, history = null, lastError = null, timer = null;
 
@@ -159,8 +157,8 @@ const deg = (v) => (v == null || !Number.isFinite(v) ? "–" : `${Math.round(v)}
 
 // --- data ------------------------------------------------------------------
 async function api(path, opts = {}) {
-  const res = await fetch(path, { ...opts, headers: { Authorization: `Bearer ${token}`, ...(opts.headers || {}) } });
-  if (res.status === 401) { store.del(TOKEN_KEY); token = null; throw new Error("unauthorized"); }
+  const write = opts.method && opts.method !== "GET";
+  const res = await fetch(path, { ...opts, headers: { ...(write ? { "X-Requested-By": "dashboard" } : {}), ...(opts.headers || {}) } });
   const json = await res.json().catch(() => ({}));
   if (!res.ok) throw new Error(json.error || `HTTP ${res.status}`);
   return json;
@@ -181,29 +179,8 @@ function schedule() {
   timer = setInterval(load, REFRESH_MS);
 }
 
-// --- token gate --------------------------------------------------------------
-function renderGate(msg) {
-  const input = el("input", { type: "password", placeholder: "MEETING_PLUG_TOKEN", autocomplete: "current-password" });
-  const form = el("form", { class: "card gate", onsubmit: (e) => {
-      e.preventDefault();
-      token = input.value.trim();
-      if (!token) return;
-      store.set(TOKEN_KEY, token);
-      app.replaceChildren(el("p", { class: "muted" }, "Loading…"));
-      load().then(schedule);
-    } },
-    el("h1", {}, "Heat pump"),
-    el("p", { class: "muted" }, "Paste one of the Pi's MEETING_PLUG_TOKEN values. It's kept in this browser only."),
-    input,
-    msg ? el("p", { class: "err" }, msg) : null,
-    el("button", { class: "primary", type: "submit" }, "Open dashboard"));
-  app.replaceChildren(form);
-  input.focus();
-}
-
 // --- main render -------------------------------------------------------------
 function render() {
-  if (!token) return renderGate(lastError === "unauthorized" ? "That token was rejected." : null);
   if (!status) {
     app.replaceChildren(el("p", { class: "err" }, `Couldn't load: ${lastError || "unknown error"}`));
     return;
@@ -605,10 +582,10 @@ function runsCard() {
 // Redraw charts at the new width.
 let resizeT;
 window.addEventListener("resize", () => { clearTimeout(resizeT); resizeT = setTimeout(() => status && render(), 150); });
-document.addEventListener("visibilitychange", () => { if (!document.hidden && token) load(); });
+document.addEventListener("visibilitychange", () => { if (!document.hidden) load(); });
 
-if (token) { app.replaceChildren(el("p", { class: "muted" }, "Loading…")); load().then(schedule); }
-else renderGate();
+app.replaceChildren(el("p", { class: "muted" }, "Loading…"));
+load().then(schedule);
 </script>
 </body>
 </html>
