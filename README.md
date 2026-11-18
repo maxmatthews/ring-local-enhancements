@@ -395,7 +395,13 @@ later.
   the thermostat by hand after it starts and your change sticks.
 - **Skipped** when the house is already at 64°F, or the unit is already heating
   to 64°F or higher.
-- **After 07:00** the unit is left as it is. Nothing switches it off yet.
+- **At 07:00 the heat goes off** (`THERMOSTAT_HEAT_OFF_TIME`; blank = never),
+  when peak power starts. This happens once a day, so heat you turn back on
+  afterwards stays on. Only HEAT is switched off; cooling is left alone. A
+  service that was down at 07:00 still catches up if it's back within
+  `THERMOSTAT_HEAT_OFF_GRACE_MINUTES` (60), so a restart in the afternoon never
+  switches off heat you turned on. Not applied in away mode, which already
+  controls the unit through the peak.
 - `THERMOSTAT_PREHEAT_ENABLED=false` turns the preheat off (e.g. for summer).
 
 ### Learning the warm-up rate

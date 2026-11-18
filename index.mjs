@@ -167,6 +167,9 @@ const THERMOSTAT_OPTS = {
   awayMarginF: num("THERMOSTAT_AWAY_MARGIN_F", THERMOSTAT_DEFAULTS.awayMarginF),
   awayMaxBankF: num("THERMOSTAT_AWAY_MAX_BANK_F", THERMOSTAT_DEFAULTS.awayMaxBankF),
   awayCopRatio: num("THERMOSTAT_AWAY_COP_RATIO", THERMOSTAT_DEFAULTS.awayCopRatio),
+  // Blank = no morning heat-off.
+  heatOffTime: (process.env.THERMOSTAT_HEAT_OFF_TIME ?? THERMOSTAT_DEFAULTS.heatOffTime).trim() || null,
+  heatOffGraceMinutes: num("THERMOSTAT_HEAT_OFF_GRACE_MINUTES", THERMOSTAT_DEFAULTS.heatOffGraceMinutes),
 };
 const THERMOSTAT_TICK_MS = parseInt(process.env.THERMOSTAT_TICK_MS || "300000", 10);
 // Until a warm-up has been learned, start no later than this (the hand-run
@@ -1963,6 +1966,15 @@ async function thermostatTick() {
         thermostatState = { ...thermostatState, preheatKey: plan.key };
         log(`Thermostat: preheat not needed -- ${plan.reason}`);
         break;
+      case "heat-off":
+        await thinq.control(thermostatDeviceId, acCommands.power(false));
+        thermostatState = { ...thermostatState, heatOffKey: plan.key };
+        log(`Thermostat: ${plan.reason}`);
+        break;
+      case "heat-off-skip":
+        thermostatState = { ...thermostatState, heatOffKey: plan.key };
+        log(`Thermostat: ${plan.reason}`);
+        break;
       case "away-heat-on":
         // Below 60°F the setpoint is the unit's floor and we cut the run on arrival.
         await thermostatHeatTo(device, plan.setpointF);
@@ -2264,6 +2276,7 @@ function thermostatStatusBody() {
     awayHeating: !!thermostatState.awayHeating,
     preheatEnabled: THERMOSTAT_PREHEAT_ENABLED,
     lastPreheat: thermostatState.preheatKey ?? null,
+    lastHeatOff: thermostatState.heatOffKey ?? null,
     settings: { ...THERMOSTAT_OPTS, latestStart: THERMOSTAT_PREHEAT_LATEST_START || null },
     last: thermostatLast,
     learnedRuns: extractWarmups(thermostatHistory).slice(-20),
@@ -2377,9 +2390,11 @@ async function main() {
     try {
       offPeakWindow(new Date(), THERMOSTAT_OPTS.windowStart, THERMOSTAT_OPTS.windowEnd); // fail fast on malformed times
       if (THERMOSTAT_PREHEAT_LATEST_START) offPeakWindow(new Date(), THERMOSTAT_PREHEAT_LATEST_START, THERMOSTAT_OPTS.windowEnd);
+      if (THERMOSTAT_OPTS.heatOffTime) timeOnDay(new Date(), THERMOSTAT_OPTS.heatOffTime);
       log(
         `  Thermostat: "${THERMOSTAT_DEVICE_NAME}" | preheat ${THERMOSTAT_PREHEAT_ENABLED ? `to ${THERMOSTAT_OPTS.targetF}°F by ${THERMOSTAT_OPTS.windowEnd} ` +
-          `(off-peak from ${THERMOSTAT_OPTS.windowStart})` : "off"} | away never below ${THERMOSTAT_OPTS.awayMinF}°F | ` +
+          `(off-peak from ${THERMOSTAT_OPTS.windowStart})` : "off"} | heat off ${THERMOSTAT_OPTS.heatOffTime ? `at ${THERMOSTAT_OPTS.heatOffTime}` : "never"} | ` +
+          `away never below ${THERMOSTAT_OPTS.awayMinF}°F | ` +
           `outdoor temps ${Number.isFinite(LATITUDE) && Number.isFinite(LONGITUDE) ? "on" : "off (no LATITUDE / LONGITUDE)"}`
       );
       startThermostat();

@@ -35,6 +35,10 @@ export const DEFAULTS = {
   targetF: 64,
   windowStart: "23:00",
   windowEnd: "07:00",
+  /** Heat off at this time each morning (home mode). null = never. */
+  heatOffTime: "07:00",
+  /** A service that was down at heatOffTime still switches off if back within this. */
+  heatOffGraceMinutes: 60,
   /**
    * Prior for a slow ducted heat pump, used until runs are learned: this rate
    * at refOutdoorF, falling by priorSlope °F/h for each °F colder outside.
@@ -380,7 +384,9 @@ export function preheatStart({
  * so changing the thermostat by hand after it starts sticks, and a restart
  * mid-preheat doesn't re-send anything.
  *
- * @returns {{action: "idle"|"preheat"|"preheat-skip"|"away-heat-on"|"away-heat-off", reason: string, startAt?: Date,
+ * Heat-off fires once a day too (state.heatOffKey = that day's date).
+ *
+ * @returns {{action: "idle"|"preheat"|"preheat-skip"|"heat-off"|"heat-off-skip"|"away-heat-on"|"away-heat-off", reason: string, startAt?: Date,
  *   minutesNeeded?: number, key?: string, run?: "bank"|"guard", setpointF?: number, bankF?: number, requiredF?: number}}
  */
 export function planThermostat({
@@ -397,6 +403,20 @@ export function planThermostat({
   const o = { ...DEFAULTS, ...opts };
 
   if (state.away) return planAway({ now, device, state, ratePerHour, coolingK, hourly, outdoorF, prices, o });
+
+  // Morning heat-off: once a day at heatOffTime, peak power starts. Only heat --
+  // cooling is left alone -- and only within the grace period, so a restart in
+  // the afternoon never switches off heat you turned on yourself.
+  if (o.heatOffTime) {
+    const offAt = timeOnDay(now, o.heatOffTime);
+    const key = localDateKey(now);
+    if (now >= offAt && +now - +offAt < o.heatOffGraceMinutes * 60 * 1000 && state.heatOffKey !== key) {
+      if (device?.power && device.mode === "HEAT") {
+        return { action: "heat-off", key, reason: `${o.heatOffTime} -- peak power starts, heat off (${device.indoorF ?? "?"}°F)` };
+      }
+      return { action: "heat-off-skip", key, reason: `${o.heatOffTime} -- ${device?.power ? `unit is in ${device.mode}, left alone` : "already off"}` };
+    }
+  }
 
   const window = offPeakWindow(now, o.windowStart, o.windowEnd);
   if (!window.inWindow) return { action: "idle", reason: "outside the off-peak window" };

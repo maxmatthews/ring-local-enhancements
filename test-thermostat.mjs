@@ -257,6 +257,43 @@ test("tick: no indoor reading -> do nothing", () => {
   assert.equal(planThermostat({ now: at(19, 3), device: dev(null), ratePerHour: 1 }).action, "idle");
 });
 
+// --- Morning heat-off ---------------------------------------------------------
+
+const heating = (indoorF = 64) => dev(indoorF, { power: true, targetF: 64 });
+
+test("heat-off: at 07:00 a heating unit is switched off", () => {
+  const p = planThermostat({ now: at(19, 7), device: heating(), ratePerHour: 1 });
+  assert.equal(p.action, "heat-off");
+  assert.equal(p.key, "2026-11-19");
+});
+
+test("heat-off: 06:59 is still the preheat's business", () => {
+  assert.notEqual(planThermostat({ now: at(19, 6, 59), device: heating(), ratePerHour: 1 }).action, "heat-off");
+});
+
+test("heat-off: once a day -- turning the heat back on afterwards sticks", () => {
+  const done = { heatOffKey: "2026-11-19" };
+  assert.equal(planThermostat({ now: at(19, 7, 30), device: heating(), state: done, ratePerHour: 1 }).action, "idle");
+  assert.equal(planThermostat({ now: at(20, 7), device: heating(), state: done, ratePerHour: 1 }).action, "heat-off", "next day fires again");
+});
+
+test("heat-off: a late restart catches up within the hour, not after", () => {
+  assert.equal(planThermostat({ now: at(19, 7, 45), device: heating(), ratePerHour: 1 }).action, "heat-off");
+  assert.equal(planThermostat({ now: at(19, 8), device: heating(), ratePerHour: 1 }).action, "idle");
+  assert.equal(planThermostat({ now: at(19, 15), device: heating(), ratePerHour: 1 }).action, "idle");
+});
+
+test("heat-off: cooling and an already-off unit are left alone (and the day is marked done)", () => {
+  assert.equal(planThermostat({ now: at(19, 7), device: dev(70, { power: true, mode: "COOL" }), ratePerHour: 1 }).action, "heat-off-skip");
+  assert.equal(planThermostat({ now: at(19, 7), device: dev(64), ratePerHour: 1 }).action, "heat-off-skip");
+});
+
+test("heat-off: can be turned off, and away mode isn't affected", () => {
+  assert.equal(planThermostat({ now: at(19, 7), device: heating(), ratePerHour: 1, opts: { heatOffTime: null } }).action, "idle");
+  const awayP = planThermostat({ now: at(19, 7), device: heating(60), state: { away: true }, ratePerHour: 1 });
+  assert.ok(!awayP.action.startsWith("heat-off"));
+});
+
 // --- Cooling model -----------------------------------------------------------
 
 function cooling(start, k, { T0 = 64, tout = 30, hours = 6, extra = {} } = {}) {

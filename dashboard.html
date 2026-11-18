@@ -277,6 +277,7 @@ function planCard() {
     headline = "Waiting for the first reading";
   }
   if (status.lastPreheat) detail.push(`Last preheat handled for the morning of ${status.lastPreheat}.`);
+  if (!status.away && s.heatOffTime) detail.push(`Heat switches off at ${s.heatOffTime} when peak power starts.`);
   if (last?.model) detail.push(`Warm-up model: ${last.model}.`);
   detail.push(`Off-peak ${s.windowStart}–${s.windowEnd}. ${status.samples} samples logged.`);
   return el("div", { class: "card" }, el("h2", {}, "Tonight"), el("div", { class: "plan" }, headline), el("p", { class: "muted", style: "margin:6px 0 0" }, detail.join(" ")));
