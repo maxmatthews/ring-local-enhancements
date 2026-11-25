@@ -6,7 +6,7 @@
   "main": "index.mjs",
   "scripts": {
     "start": "node index.mjs",
-    "test": "node test-level-sync.mjs && node test-meeting-plug.mjs && node test-blind-holds.mjs && node test-govee-lights.mjs && node test-thermostat.mjs && node test-ngrid.mjs",
+    "test": "node test-level-sync.mjs && node test-meeting-plug.mjs && node test-blind-holds.mjs && node test-govee-lights.mjs && node test-thermostat.mjs && node test-water-heater.mjs && node test-ngrid.mjs",
     "diag": "node diag-level-sync.mjs",
     "deploy": "./deploy.sh",
     "auth": "npx -p ring-client-api ring-auth-cli",
@@ -19,6 +19,7 @@
   "dependencies": {
     "dirigera": "^1.8.1",
     "mdns-server": "^1.0.11",
+    "mqtt": "^5.16.1",
     "ring-client-api": "^14.3.0",
     "suncalc": "^1.9.0"
   },

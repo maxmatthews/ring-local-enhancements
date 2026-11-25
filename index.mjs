@@ -28,6 +28,8 @@ import { holdOpenReason } from "./blind-holds.mjs";
 import { createGoveeClient } from "./govee.mjs";
 import { pickScene, planLights, localDateKey, timeOnDay, DEFAULT_SCENE, DEFAULT_LEAD_DAYS } from "./govee-lights.mjs";
 import { createThinqClient, summarizeAcState, acCommands } from "./thinq.mjs";
+import { createEconetClient } from "./econet.mjs";
+import { planWaterHeater, waterHeaterSchedule, summarizeWaterHeater, diffWaterHeater, retryDelayMs, WH_DEFAULTS } from "./water-heater.mjs";
 import {
   offPeakWindow,
   extractWarmups,
@@ -36,6 +38,10 @@ import {
   fitCoolingModel,
   planThermostat,
   meanForecast,
+  trustedSamples,
+  parseReturnAt,
+  findRoomSensor,
+  roomSensorF,
   DEFAULTS as THERMOSTAT_DEFAULTS,
 } from "./thermostat.mjs";
 import { fetchOutdoor } from "./weather.mjs";
@@ -172,9 +178,27 @@ const THERMOSTAT_OPTS = {
   heatOffGraceMinutes: num("THERMOSTAT_HEAT_OFF_GRACE_MINUTES", THERMOSTAT_DEFAULTS.heatOffGraceMinutes),
 };
 const THERMOSTAT_TICK_MS = parseInt(process.env.THERMOSTAT_TICK_MS || "300000", 10);
+// A Dirigera environment sensor (by name or room) whose temperature stands in
+// for the unit's own reading. Blank = the unit's reading. Falls back to it
+// whenever the sensor or the hub can't be read.
+const THERMOSTAT_ROOM_SENSOR = (process.env.THERMOSTAT_ROOM_SENSOR || "").trim();
 // Until a warm-up has been learned, start no later than this (the hand-run
 // routine that's known to work). Blank = no cap.
 const THERMOSTAT_PREHEAT_LATEST_START = process.env.THERMOSTAT_PREHEAT_LATEST_START ?? "03:00";
+// Rheem EcoNet heat pump water heater: off while away, back on for the return.
+// Unofficial cloud API -- see econet.mjs. Blank email/password = left alone.
+const ECONET_EMAIL = (process.env.ECONET_EMAIL || "").trim();
+const ECONET_PASSWORD = process.env.ECONET_PASSWORD || "";
+const ECONET_WATER_HEATER = (process.env.ECONET_WATER_HEATER || "").trim(); // by name; blank = the only one
+const WATER_HEATER_OPTS = {
+  onTime: process.env.WATER_HEATER_ON_TIME || WH_DEFAULTS.onTime,
+  dropTime: process.env.WATER_HEATER_DROP_TIME || WH_DEFAULTS.dropTime,
+  boostF: num("WATER_HEATER_BOOST_F", WH_DEFAULTS.boostF),
+  normalF: num("WATER_HEATER_NORMAL_F", WH_DEFAULTS.normalF),
+  // A start that would land in peak hours waits for off-peak: the heat pump's window.
+  windowStart: THERMOSTAT_OPTS.windowStart,
+  windowEnd: THERMOSTAT_OPTS.windowEnd,
+};
 // Leviton load center: the heat pump breaker's readings, for the dashboard
 // only. Read-only -- see leviton.mjs.
 const LEVITON_EMAIL = process.env.LEVITON_EMAIL;
@@ -267,6 +291,8 @@ const goveeLightsEnabled = !!(GOVEE_API_KEY && Number.isFinite(LATITUDE) && Numb
 // Outdoor temperature (LATITUDE / LONGITUDE) sharpens the warm-up prediction
 // but isn't required: without it the model just can't adjust for the weather.
 const thermostatEnabled = !!THINQ_PAT;
+// Follows the heat pump's away mode and return time, so it needs the thermostat.
+const waterHeaterEnabled = !!(thermostatEnabled && ECONET_EMAIL && ECONET_PASSWORD);
 const levitonEnabled = !!(thermostatEnabled && LEVITON_EMAIL && LEVITON_PASSWORD);
 // One listener serves the meeting plug (behind its bearer tokens) and the
 // thermostat dashboard + API (open on the LAN, by choice).
@@ -1776,7 +1802,7 @@ function startGoveeLights() {
 // LG ThinQ thermostat (Central Air heat pump)
 // ---------------------------------------------------------------------------
 
-// { preheatKey, away, awaySince, awaySnapshot, awayHeating } -- see thermostat.mjs.
+// { preheatKey, heatOffKey, away, awaySince, awaySnapshot, awayHeating, awayRun, returnAt } -- see thermostat.mjs.
 const THERMOSTAT_STATE_FILE = resolve(__dirname, ".thermostat-state.json");
 // One JSON sample per tick: what the warm-up model learns from. Append-only,
 // pruned to THERMOSTAT_HISTORY_DAYS at startup.
@@ -1795,6 +1821,36 @@ let thermostatLast = null; // the last tick's reading and plan, for GET /thermos
 let thermostatAnnouncedKey = null;
 let thermostatTickTimer = null;
 let thermostatTickBusy = false;
+let roomSensorId = null;
+let roomSensorLabel = null;
+let roomSensorLastError = undefined; // logged on change only
+
+/**
+ * The room sensor's temperature, or { error } -- the tick then uses the unit's
+ * own reading. Needs the Dirigera hub connection the blinds use.
+ */
+async function readRoomSensor(now) {
+  if (!THERMOSTAT_ROOM_SENSOR) return { error: "none configured" };
+  if (!dirigera) return { error: "Dirigera hub not connected" };
+  try {
+    let sensor;
+    if (roomSensorId) {
+      sensor = await withTimeout(hub().environmentSensors.get({ id: roomSensorId }), DIRIGERA_PROBE_TIMEOUT_MS, "Room sensor read");
+    } else {
+      const sensors = await withTimeout(hub().environmentSensors.list(), DIRIGERA_PROBE_TIMEOUT_MS, "Room sensor list");
+      sensor = findRoomSensor(sensors, THERMOSTAT_ROOM_SENSOR);
+      if (!sensor) {
+        return { error: `no environment sensor matching "${THERMOSTAT_ROOM_SENSOR}" (have: ${sensors.map((d) => d.attributes?.customName).join(", ") || "none"})` };
+      }
+      roomSensorId = sensor.id;
+      roomSensorLabel = sensor.room?.name || sensor.attributes.customName;
+    }
+    return { ...roomSensorF(sensor, now, THERMOSTAT_OPTS), name: roomSensorLabel };
+  } catch (err) {
+    if (/404|not an environmentSensor/i.test(err.message)) roomSensorId = null; // re-paired: look it up again
+    return { error: err.message };
+  }
+}
 
 function loadThermostatState() {
   if (!existsSync(THERMOSTAT_STATE_FILE)) return {};
@@ -1886,34 +1942,63 @@ async function thermostatHeatTo(device, targetF) {
   if (device.targetF !== targetF) await thinq.control(thermostatDeviceId, acCommands.heatTargetF(targetF));
 }
 
-function thermostatCoolingModel() {
-  return fitCoolingModel(extractCooldowns(thermostatHistory), THERMOSTAT_OPTS);
+// Learning only sees readings that could be the house -- not defrost blips.
+function thermostatCoolingModel(clean = trustedSamples(thermostatHistory)) {
+  return fitCoolingModel(extractCooldowns(clean), THERMOSTAT_OPTS);
 }
 
-function thermostatModel() {
-  return fitWarmupModel(extractWarmups(thermostatHistory), THERMOSTAT_OPTS);
+function thermostatModel(clean = trustedSamples(thermostatHistory)) {
+  return fitWarmupModel(extractWarmups(clean), THERMOSTAT_OPTS);
 }
 
 async function thermostatTick() {
   refreshLevitonLive().catch((err) => logError("Leviton refresh failed", err));
+  runWaterHeaterTickSoon();
   refreshNgridRates().catch((err) => logError("National Grid refresh failed", err));
   if (thermostatTickBusy) return;
   thermostatTickBusy = true;
   try {
     if (!(await resolveThermostatDevice())) return;
     const now = new Date();
-    const device = summarizeAcState(await thinq.getState(thermostatDeviceId));
+    const reading = summarizeAcState(await thinq.getState(thermostatDeviceId));
     const outdoor = await outdoorWeather();
-    recordThermostatSample({ t: now.getTime(), ...device, outdoorF: outdoor?.nowF ?? null, away: !!thermostatState.away });
+    // The room sensor is the house's temperature when it can be read; the unit's own reading otherwise.
+    const room = await readRoomSensor(now);
+    if (THERMOSTAT_ROOM_SENSOR && (room.error ?? null) !== roomSensorLastError) {
+      log(room.error ? `Thermostat: room sensor unavailable (${room.error}) -- using the unit's own reading` : `Thermostat: indoor temperature from the "${room.name}" sensor`);
+      roomSensorLastError = room.error ?? null;
+    }
+    const fromRoom = Number.isFinite(room.indoorF);
+    const sample = {
+      t: now.getTime(),
+      ...reading,
+      indoorF: fromRoom ? room.indoorF : reading.indoorF,
+      indoorSource: fromRoom ? "room" : "unit",
+      unitIndoorF: reading.indoorF,
+      outdoorF: outdoor?.nowF ?? null,
+      away: !!thermostatState.away,
+    };
+    recordThermostatSample(sample);
+
+    // A defrost blip isn't the house: decide on the last reading that could be.
+    const clean = trustedSamples(thermostatHistory);
+    let device = { ...reading, indoorF: sample.indoorF };
+    if (Number.isFinite(sample.indoorF) && clean[clean.length - 1] !== sample) {
+      const trusted = clean.findLast((s) => Number.isFinite(s.indoorF));
+      if (trusted) {
+        device = { ...reading, indoorF: trusted.indoorF };
+        log(`Thermostat: ignoring an indoor reading of ${sample.indoorF}°F (a defrost blip?) -- using ${trusted.indoorF}°F from ${new Date(trusted.t).toLocaleTimeString()}`);
+      }
+    }
 
     const window = offPeakWindow(now, THERMOSTAT_OPTS.windowStart, THERMOSTAT_OPTS.windowEnd);
     // What matters is the weather while it's heating: the forecast over what's left of the window.
     const forecastF = outdoor ? meanForecast(outdoor.hourly, now > window.start ? now : window.start, window.end) : null;
-    const model = thermostatModel();
+    const model = thermostatModel(clean);
     const ratePerHour = model.rateAt(forecastF ?? outdoor?.nowF ?? null);
     const state = THERMOSTAT_PREHEAT_ENABLED || thermostatState.away ? thermostatState : { ...thermostatState, preheatKey: window.key };
     const latestStart = model.kind === "default" && THERMOSTAT_PREHEAT_LATEST_START ? THERMOSTAT_PREHEAT_LATEST_START : null;
-    const cooling = thermostatCoolingModel();
+    const cooling = thermostatCoolingModel(clean);
     const plan = planThermostat({
       now,
       device,
@@ -1929,6 +2014,8 @@ async function thermostatTick() {
     thermostatLast = {
       at: now.toISOString(),
       device,
+      // Where device.indoorF came from; unitIndoorF is the heat pump's own reading.
+      indoor: { source: sample.indoorSource, room: THERMOSTAT_ROOM_SENSOR ? { name: room.name ?? THERMOSTAT_ROOM_SENSOR, f: room.indoorF ?? null, at: room.at ?? null, error: room.error ?? null } : null, unitIndoorF: reading.indoorF },
       outdoorF: outdoor?.nowF ?? null,
       forecastF,
       ratePerHour,
@@ -1937,15 +2024,22 @@ async function thermostatTick() {
       plan,
     };
 
-    const announceKey = `${thermostatState.away ? "away" : "home"}:${plan.key}`;
-    if (plan.startAt && thermostatState.away && thermostatAnnouncedKey !== announceKey) {
+    const announceKey = `${thermostatState.away ? "away" : "home"}:${plan.key}:${thermostatState.returnAt ?? ""}`;
+    if (thermostatState.away && plan.bankF == null && plan.returnAt && thermostatAnnouncedKey !== announceKey) {
+      thermostatAnnouncedKey = announceKey;
+      log(
+        `Thermostat: away -- back ${plan.returnAt.toLocaleString()}, no bank needed; warm-up to ${THERMOSTAT_OPTS.targetF}°F ` +
+          `expected ~${plan.returnStartAt.toLocaleString()}`
+      );
+    } else if (plan.startAt && thermostatState.away && thermostatAnnouncedKey !== announceKey) {
       thermostatAnnouncedKey = announceKey;
       log(
         `Thermostat: away -- bank to ${plan.bankF}°F by ${THERMOSTAT_OPTS.windowEnd} (coasting the peak needs ` +
           `${plan.requiredF.toFixed(1)}°F` +
           `${plan.worthF < plan.requiredF ? `; at these prices only the first ${plan.horizonHours.toFixed(1)}h of it is worth banking, ${plan.worthF.toFixed(1)}°F` : ""}` +
           `${Math.ceil(plan.worthF) > plan.bankF ? `; capped at ${plan.bankF}°F` : ""}), ` +
-          `expected ~${plan.startAt.toLocaleTimeString()}; floor ${THERMOSTAT_OPTS.awayMinF}°F -- ${cooling.describe}`
+          `expected ~${plan.startAt.toLocaleTimeString()}; floor ${THERMOSTAT_OPTS.awayMinF}°F -- ${cooling.describe}` +
+          `${plan.returnAt ? `; back ${plan.returnAt.toLocaleString()}${plan.returnF != null ? ` (${THERMOSTAT_OPTS.targetF}°F then needs ${plan.returnF.toFixed(1)}°F banked)` : ""}` : ""}`
       );
     } else if (plan.startAt && thermostatAnnouncedKey !== announceKey) {
       thermostatAnnouncedKey = announceKey;
@@ -1986,6 +2080,14 @@ async function thermostatTick() {
         thermostatState = { ...thermostatState, awayHeating: false, awayRun: null };
         log(`Thermostat: ${plan.reason} -- off`);
         break;
+      case "away-end":
+        // Back: leave the heat on at the target rather than restoring how it
+        // was when you left (usually off). Home mode runs it from here.
+        await thermostatHeatTo(device, THERMOSTAT_OPTS.targetF);
+        thermostatState = endAwayState();
+        log(`Thermostat: ${plan.reason}`);
+        runWaterHeaterTickSoon();
+        break;
       default:
         return;
     }
@@ -2002,9 +2104,31 @@ function runThermostatTickSoon() {
   setTimeout(() => thermostatTick().catch((err) => logError("Thermostat tick failed", err)), 0);
 }
 
-async function setThermostatAway(away) {
+function endAwayState() {
+  return { ...thermostatState, away: false, awaySince: null, awaySnapshot: null, awayHeating: false, awayRun: null, returnAt: null };
+}
+
+/** Set or clear (null) when you'll be back. Only while away; the tick plans around it. */
+function setThermostatReturn(returnAt) {
+  if (!thermostatState.away) throw Object.assign(new Error("not in away mode"), { status: 409 });
+  const at = returnAt == null || returnAt === "" ? null : parseReturnAt(returnAt);
+  thermostatState = { ...thermostatState, returnAt: at ? at.toISOString() : null };
+  setWaterHeaterSchedule(at);
+  saveThermostatState();
+  log(`Thermostat: ${at ? `back ${at.toLocaleString()} -- ${THERMOSTAT_OPTS.targetF}°F by then` : "return time cleared"}`);
+  runThermostatTickSoon();
+  runWaterHeaterTickSoon();
+  return { returnAt: thermostatState.returnAt };
+}
+
+async function setThermostatAway(away, { returnAt } = {}) {
   if (!(await resolveThermostatDevice())) throw new Error(`no thermostat matching "${THERMOSTAT_DEVICE_NAME}"`);
-  if (!!thermostatState.away === away) return { changed: false };
+  // Checked before anything changes, so a bad time leaves away mode as it was.
+  const back = away && returnAt != null && returnAt !== "" ? parseReturnAt(returnAt) : null;
+  if (!!thermostatState.away === away) {
+    if (back) return { changed: false, ...setThermostatReturn(back.toISOString()) };
+    return { changed: false };
+  }
   const device = summarizeAcState(await thinq.getState(thermostatDeviceId));
 
   if (away) {
@@ -2016,16 +2140,26 @@ async function setThermostatAway(away) {
       awaySnapshot: { power: device.power, mode: device.mode, targetF: device.targetF },
       awayHeating: false,
       awayRun: null,
+      returnAt: back ? back.toISOString() : null,
     };
+    setWaterHeaterSchedule(back);
     saveThermostatState();
-    log(`Thermostat: away mode on -- never below ${THERMOSTAT_OPTS.awayMinF}°F, heat banked off-peak (was ${device.power ? `${device.mode} ${device.targetF}°F` : "off"})`);
+    log(
+      `Thermostat: away mode on -- never below ${THERMOSTAT_OPTS.awayMinF}°F, heat banked off-peak (was ${device.power ? `${device.mode} ${device.targetF}°F` : "off"})` +
+        `${back ? `; back ${back.toLocaleString()}` : ""}`
+    );
     runThermostatTickSoon(); // switches off whatever is running, or starts heat if already cold
-    return { changed: true, device };
+    runWaterHeaterTickSoon(); // and the water heater off
+    return { changed: true, device, returnAt: thermostatState.returnAt };
   }
 
   const snap = thermostatState.awaySnapshot;
-  thermostatState = { ...thermostatState, away: false, awaySince: null, awaySnapshot: null, awayHeating: false, awayRun: null };
+  thermostatState = endAwayState();
+  // Home before the water heater's return schedule started: start it now.
+  const whSch = waterHeaterSchedulePersisted();
+  if (!whSch || whSch.onAt > new Date()) setWaterHeaterSchedule(new Date());
   saveThermostatState();
+  runWaterHeaterTickSoon();
   try {
     if (snap?.power) {
       if (snap.mode === "HEAT") await thermostatHeatTo(device, snap.targetF);
@@ -2046,6 +2180,157 @@ async function setThermostatAway(away) {
   }
   runThermostatTickSoon();
   return { changed: true, restored: true };
+}
+
+// --- Rheem water heater (follows away mode) ----------------------------------------
+
+// Its schedule ({ onAt, dropAt }) lives in thermostatState.waterHeater, so it
+// survives restarts and outlasts away mode (the 06:00 drop is often after it).
+const WATER_HEATER_SETTLE_MS = 3000; // between the commands of one change
+const WATER_HEATER_RECHECK_MS = 30 * 60 * 1000; // re-read a heater that's where it should be
+const WATER_HEATER_ESCALATE_AFTER = 6; // attempts before failures are logged as errors
+
+let econet = null;
+let waterHeaterBusy = false;
+let waterHeaterTimer = null;
+let waterHeaterKey = null; // the desired state the attempts below are for
+let waterHeaterAttempts = 0;
+let waterHeaterCheckedAt = 0;
+let waterHeaterRetryAt = 0; // the next attempt isn't due before this
+let waterHeaterLast = null; // { at, state } as last reported
+let waterHeaterNote = null; // last problem, for the dashboard and to log once
+
+function waterHeaterSchedulePersisted() {
+  const sch = thermostatState.waterHeater?.schedule;
+  return sch ? { onAt: new Date(sch.onAt), dropAt: new Date(sch.dropAt) } : null;
+}
+
+/** Set (from a return time) or clear the heater's return schedule. */
+function setWaterHeaterSchedule(returnAt, now = new Date()) {
+  if (!waterHeaterEnabled) return;
+  const sch = returnAt ? waterHeaterSchedule(returnAt, now, WATER_HEATER_OPTS) : null;
+  thermostatState = { ...thermostatState, waterHeater: { schedule: sch ? { onAt: sch.onAt.toISOString(), dropAt: sch.dropAt.toISOString() } : null } };
+  if (sch) log(`Water heater: on at ${WATER_HEATER_OPTS.boostF}°F ${sch.onAt.toLocaleString()}, ${WATER_HEATER_OPTS.normalF}°F from ${sch.dropAt.toLocaleString()}`);
+}
+
+function waterHeaterNoteOnce(note, asError = false) {
+  if (note === waterHeaterNote) return;
+  waterHeaterNote = note;
+  if (note) (asError ? logError : log)(`Water heater: ${note}`);
+}
+
+function retryWaterHeaterIn(ms) {
+  waterHeaterRetryAt = Date.now() + ms;
+  clearTimeout(waterHeaterTimer);
+  waterHeaterTimer = setTimeout(() => waterHeaterTick().catch((err) => logError("Water heater tick failed", err)), ms);
+  waterHeaterTimer.unref();
+}
+
+async function findWaterHeater() {
+  const heaters = await econet.listWaterHeaters();
+  if (!heaters.length) throw new Error("no water heater on the EcoNet account");
+  if (!ECONET_WATER_HEATER) return heaters[0];
+  const want = ECONET_WATER_HEATER.toLowerCase();
+  const name = (h) => String(h["@NAME"]?.value || "").toLowerCase();
+  const match = heaters.find((h) => name(h) === want) || heaters.find((h) => name(h).includes(want));
+  if (!match) throw new Error(`no water heater named "${ECONET_WATER_HEATER}" (have: ${heaters.map((h) => h["@NAME"]?.value).join(", ")})`);
+  return match;
+}
+
+/**
+ * Bring the heater to what planWaterHeater() wants, and keep at it: nothing
+ * counts until the heater reports it, since its Wi-Fi drops commands. Each
+ * attempt sends only what's still different, then re-reads after
+ * retryDelayMs() (30s, 1m, 2m, 5m, then every 10m) until it matches. Runs
+ * on every thermostat tick and right after away mode or the return changes.
+ */
+async function waterHeaterTick() {
+  if (!econet || waterHeaterBusy) return;
+  waterHeaterBusy = true;
+  try {
+    const now = new Date();
+    const desired = planWaterHeater({ now, away: !!thermostatState.away, schedule: waterHeaterSchedulePersisted(), opts: WATER_HEATER_OPTS });
+    if (!desired) {
+      waterHeaterKey = null;
+      waterHeaterAttempts = 0;
+      clearTimeout(waterHeaterTimer);
+      return;
+    }
+    const key = JSON.stringify({ e: desired.enabled, m: desired.mode, s: desired.setpointF });
+    if (key !== waterHeaterKey) {
+      waterHeaterKey = key;
+      waterHeaterAttempts = 0;
+      waterHeaterCheckedAt = 0;
+      waterHeaterRetryAt = 0;
+    }
+    // Mid-retry: give the last attempt its full wait before looking again.
+    if (+now < waterHeaterRetryAt - 1000) return;
+    // Already confirmed: only an occasional look, in case someone changed it in the app.
+    if (waterHeaterAttempts === 0 && waterHeaterCheckedAt && +now - waterHeaterCheckedAt < WATER_HEATER_RECHECK_MS) return;
+
+    const equip = await findWaterHeater();
+    const state = summarizeWaterHeater(equip);
+    waterHeaterLast = { at: now.toISOString(), state };
+    waterHeaterCheckedAt = +now;
+    const { payloads, problems } = diffWaterHeater(state, desired);
+    const want = desired.enabled ? `on, ${desired.mode.toLowerCase().replace(/_/g, " ")}, ${desired.setpointF}°F` : "off";
+
+    if (!payloads.length) {
+      if (waterHeaterAttempts > 0) log(`Water heater: confirmed ${want} after ${waterHeaterAttempts} attempt${waterHeaterAttempts === 1 ? "" : "s"}`);
+      waterHeaterAttempts = 0;
+      waterHeaterNoteOnce(problems.length ? `can't fully do it on this unit: ${problems.join("; ")}` : null, !!problems.length);
+      if (desired.final && !problems.length) {
+        thermostatState = { ...thermostatState, waterHeater: { schedule: null } };
+        saveThermostatState();
+        log(`Water heater: back to everyday ${desired.setpointF}°F -- return schedule done`);
+      }
+      return;
+    }
+
+    if (!state.connected) {
+      // Reported offline: a command now would just be dropped. Keep looking.
+      waterHeaterNoteOnce(`offline in EcoNet -- will send "${want}" once it's back`);
+      retryWaterHeaterIn(retryDelayMs(waterHeaterAttempts));
+      return;
+    }
+    for (const [i, payload] of payloads.entries()) {
+      if (i) await sleep(WATER_HEATER_SETTLE_MS);
+      await econet.publish(equip, payload);
+    }
+    waterHeaterAttempts++;
+    const msg = `${desired.reason} -- sent ${payloads.map((p) => JSON.stringify(p)).join(" then ")} (attempt ${waterHeaterAttempts}; heater reports ${state.enabled ? `on, ${state.mode?.toLowerCase().replace(/_/g, " ")}, ${state.setpointF}°F` : "off"})`;
+    if (waterHeaterAttempts > WATER_HEATER_ESCALATE_AFTER) logError(`Water heater: still not confirmed -- ${msg}`);
+    else log(`Water heater: ${msg}`);
+    if (problems.length) waterHeaterNoteOnce(`can't fully do it on this unit: ${problems.join("; ")}`, true);
+    else waterHeaterNote = null;
+    retryWaterHeaterIn(retryDelayMs(waterHeaterAttempts - 1));
+  } catch (err) {
+    // Rheem's cloud, the sign-in or the network: same schedule as a dropped command.
+    waterHeaterNoteOnce(`${err.message} -- retrying`, true);
+    retryWaterHeaterIn(retryDelayMs(waterHeaterAttempts++));
+  } finally {
+    waterHeaterBusy = false;
+  }
+}
+
+function runWaterHeaterTickSoon() {
+  if (econet) setTimeout(() => waterHeaterTick().catch((err) => logError("Water heater tick failed", err)), 0);
+}
+
+function waterHeaterStatusBody() {
+  if (!waterHeaterEnabled) return { enabled: false };
+  const now = new Date();
+  const schedule = waterHeaterSchedulePersisted();
+  const desired = planWaterHeater({ now, away: !!thermostatState.away, schedule, opts: WATER_HEATER_OPTS });
+  return {
+    enabled: true,
+    settings: WATER_HEATER_OPTS,
+    schedule: schedule ? { onAt: schedule.onAt.toISOString(), dropAt: schedule.dropAt.toISOString() } : null,
+    desired,
+    reported: waterHeaterLast,
+    attempts: waterHeaterAttempts,
+    note: waterHeaterNote,
+  };
 }
 
 // --- Leviton heat pump breaker (dashboard only) ------------------------------
@@ -2240,7 +2525,9 @@ function downsample(samples, max = 2000) {
 async function thermostatHistoryBody(hours) {
   const toMs = Date.now();
   const fromMs = toMs - hours * 60 * 60 * 1000;
-  const samples = thermostatHistory.filter((s) => s.t >= fromMs);
+  // Defrost blips are marked so the chart can leave them out; the table still shows them.
+  const trusted = new Set(trustedSamples(thermostatHistory));
+  const samples = thermostatHistory.filter((s) => s.t >= fromMs).map((s) => (trusted.has(s) ? s : { ...s, suspect: true }));
   return {
     from: new Date(fromMs).toISOString(),
     to: new Date(toMs).toISOString(),
@@ -2274,15 +2561,18 @@ function thermostatStatusBody() {
     away: !!thermostatState.away,
     awaySince: thermostatState.awaySince ?? null,
     awayHeating: !!thermostatState.awayHeating,
+    awayRun: thermostatState.awayHeating ? thermostatState.awayRun ?? null : null,
+    returnAt: thermostatState.returnAt ?? null,
     preheatEnabled: THERMOSTAT_PREHEAT_ENABLED,
     lastPreheat: thermostatState.preheatKey ?? null,
     lastHeatOff: thermostatState.heatOffKey ?? null,
     settings: { ...THERMOSTAT_OPTS, latestStart: THERMOSTAT_PREHEAT_LATEST_START || null },
     last: thermostatLast,
-    learnedRuns: extractWarmups(thermostatHistory).slice(-20),
+    learnedRuns: extractWarmups(trustedSamples(thermostatHistory)).slice(-20),
     samples: thermostatHistory.length,
     breaker: levitonBreaker,
     rates: ngridStatus(),
+    waterHeater: waterHeaterStatusBody(),
     window: (() => {
       const w = offPeakWindow(new Date(), THERMOSTAT_OPTS.windowStart, THERMOSTAT_OPTS.windowEnd);
       return { start: w.start.toISOString(), end: w.end.toISOString(), inWindow: w.inWindow };
@@ -2297,9 +2587,24 @@ async function handleThermostatRequest(req, res, path) {
     const hours = Math.min(LEVITON_MAX_DAYS * 24, Math.max(1, parseInt(new URL(req.url, "http://localhost").searchParams.get("hours") || "48", 10) || 48));
     return sendJson(res, 200, await thermostatHistoryBody(hours));
   }
-  if (req.method === "POST" && (path === "/thermostat/away" || path === "/thermostat/home")) {
-    const result = await setThermostatAway(path === "/thermostat/away");
-    return sendJson(res, 200, { ok: true, ...result, away: !!thermostatState.away });
+  if (req.method === "POST" && (path === "/thermostat/away" || path === "/thermostat/home" || path === "/thermostat/return")) {
+    let body;
+    try {
+      body = await readJsonBody(req);
+    } catch (err) {
+      return sendJson(res, 400, { error: err.message });
+    }
+    try {
+      if (path === "/thermostat/return") {
+        return sendJson(res, 200, { ok: true, ...setThermostatReturn(body.returnAt ?? null), away: !!thermostatState.away });
+      }
+      const result = await setThermostatAway(path === "/thermostat/away", { returnAt: body.returnAt });
+      return sendJson(res, 200, { ok: true, ...result, away: !!thermostatState.away });
+    } catch (err) {
+      // A bad return time, or setting one while home -- the caller's to fix.
+      if (err.status === 409 || /^returnAt /.test(err.message)) return sendJson(res, err.status || 400, { error: err.message });
+      throw err;
+    }
   }
   return sendJson(res, 404, { error: "not found" });
 }
@@ -2321,6 +2626,16 @@ function startThermostat() {
   }
   thermostatState = loadThermostatState();
   thermostatHistory = loadThermostatHistory();
+  if (waterHeaterEnabled) {
+    econet = createEconetClient({ email: ECONET_EMAIL, password: ECONET_PASSWORD });
+    const sch = waterHeaterSchedulePersisted();
+    log(
+      `  Water heater: off while away; on at ${WATER_HEATER_OPTS.boostF}°F ${WATER_HEATER_OPTS.onTime} the night before you're back, ` +
+        `${WATER_HEATER_OPTS.normalF}°F from ${WATER_HEATER_OPTS.dropTime}${sch ? ` (scheduled: on ${sch.onAt.toLocaleString()}, ${WATER_HEATER_OPTS.normalF}°F ${sch.dropAt.toLocaleString()})` : ""}`
+    );
+  } else {
+    log("  Water heater disabled (missing ECONET_EMAIL / ECONET_PASSWORD)");
+  }
   ngridRates = loadNgridRates();
   const model = thermostatModel();
   log(`  Thermostat: ${thermostatHistory.length} samples, warm-up model: ${model.describe}; cooling: ${thermostatCoolingModel().describe}`);

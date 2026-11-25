@@ -11,7 +11,8 @@ Local-network glue for a Ring + IKEA Dirigera home. One Node service
 | 4 | **Level-sync retry** — re-send a house-wide blind level to the blinds that missed it, plus a full-open nudge | Ring + Dirigera | `BLIND_LEVEL_SYNC_ENABLED=false` |
 | 5 | **Meeting-triggered smart plug** — switch a SmartThings plug on when MeetingBar joins a meeting, off when the meeting is scheduled to end | Ring + SmartThings + a Mac | omit `MEETING_PLUG_TOKEN` |
 | 6 | **Govee outdoor lights** — permanent outdoor lights on at sunset and off at 23:15, with a random holiday scene in the run-up to a holiday | Govee + `LATITUDE` / `LONGITUDE` | omit `GOVEE_API_KEY` |
-| 7 | **Heat pump preheat + away mode** — heat the house to 64°F just before the 07:00 end of off-peak power, starting as late as the learned warm-up rate allows; while away, never below 48°F with heat banked off-peak; local dashboard with Leviton breaker readings | LG ThinQ (+ `LATITUDE` / `LONGITUDE` for outdoor temps) | omit `THINQ_PAT` |
+| 7 | **Heat pump preheat + away mode** — heat the house to 64°F just before the 07:00 end of off-peak power, starting as late as the learned warm-up rate allows; while away, never below 48°F with heat banked off-peak, and 64°F again by the return time; local dashboard with Leviton breaker readings | LG ThinQ (+ `LATITUDE` / `LONGITUDE` for outdoor temps, + Dirigera for a room sensor) | omit `THINQ_PAT` |
+| 8 | **Water heater follows away mode** — a Rheem heat pump water heater off while away, back on at 140°F the night before the return, 120°F from 06:00 | Rheem EcoNet + feature 7 | omit `ECONET_EMAIL` |
 
 Each feature degrades independently: missing config disables just that
 feature and logs why at startup, and a setup failure (Dirigera unreachable,
@@ -404,6 +405,28 @@ later.
   controls the unit through the peak.
 - `THERMOSTAT_PREHEAT_ENABLED=false` turns the preheat off (e.g. for summer).
 
+### Indoor temperature: room sensor
+
+The unit reports the indoor temperature in whole degrees from its own sensor.
+With `THERMOSTAT_ROOM_SENSOR` set (here, `Primary Bedroom`, an IKEA ALPSTUGA
+on the Dirigera hub), every tick reads that sensor instead, to a tenth of a
+degree, and all of the above runs on it: when the preheat starts, the away
+floor and bank, the return warm-up, and the learning. The unit's own reading
+is still recorded beside it (`unitIndoorF`). The dashboard draws it as a faint
+dashed line, which shows how the two compare while heating.
+
+When the sensor can't be read, the tick falls back to the unit's reading:
+it's unreachable, more than 30 minutes stale, or the hub is down. Every
+sample records which one it used (`indoorSource`). A warm-up, cool-down or
+bad-reading check never spans a switch between the two, since they sit a
+degree or two apart. Runs learned from the unit's sensor keep counting until
+enough bedroom runs replace them.
+
+The unit still holds its setpoint on **its own** sensor. If the bedroom runs
+cooler or warmer than that while heating, the house lands a little off 64°F.
+The two lines on the dashboard show by how much, and the setpoint can be
+offset once there are a few nights of data.
+
 ### Learning the warm-up rate
 
 Every tick appends a sample (indoor, setpoint, power, mode, outdoor °F) to
@@ -417,6 +440,14 @@ temperature during the run.
 | none | Prior: `THERMOSTAT_DEFAULT_RATE_F_PER_HOUR` (1.0) at 35°F outside, 0.03°F/h slower for each °F colder |
 | a few, or all at similar outdoor temps | Their duration-weighted mean, shifted along that same 0.03 slope to tonight's temperature |
 | 4+ spread over 8°F+ of outdoor temps | Least-squares line, rate vs outdoor temperature |
+
+**Bad readings.** In cold weather the unit sometimes reports the house 9–30°F
+colder for 5–10 minutes while it heats (64, 36, 37, 63), most likely a
+defrost cycle chilling the sensor. A reading more than 3°F below the last
+trusted one is ignored, for both decisions and learning, unless it's still
+that low 30 minutes later. Rises are always believed, since the air warms
+quickly while the unit runs. The raw readings stay in the history file. The
+dashboard's chart leaves them out, and its table marks them "(ignored)".
 
 Rates are clamped to 0.25–8°F/h. The prior is deliberately slow, so the first
 cold nights start early rather than late. Outdoor temperatures come from
@@ -474,6 +505,28 @@ that leans leaky, and `k` is scaled ×1.25 on top. With the prior, a 30°F day
 calls for a bank of ~66°F, so expect long overnight runs until real
 cool-downs are learned.
 
+### Return time
+
+While away you can set when you'll be back (the dashboard's **Back home**
+field, or `POST /thermostat/return`). The house is then at
+`THERMOSTAT_PREHEAT_TARGET_F` (64°F) when you walk in:
+
+- **Warm-up.** It heats to 64°F to arrive just as you do, timed like the
+  preheat from the house's temperature and the warm-up rate, and then holds 64.
+  This comes before everything else, the floor guard included.
+- **Bank for it.** If you're back during the coming peak, tonight's bank aims
+  to still have the house at 64°F when you get back. The same price check
+  applies: if that's too far into the peak to be worth banking, it banks for
+  the floor as usual. Whatever's left is a short warm-up before you arrive.
+  The 70°F cap still holds.
+- **Back overnight.** If you're back before 07:00, there's no bank. The warm-up
+  runs on off-peak power.
+- **On the return time** away mode ends by itself and the heat is left **on**
+  at 64°F, rather than going back to how it was when you left. Home mode
+  takes over from there, including the 07:00 heat-off.
+
+The time must be in the future and within 90 days. "I'm home" clears it.
+
 Away mode is switched from the dashboard, or over the same listener as the
 meeting plug. These endpoints need no token: they're open to the home network
 by choice. Writes must carry an `X-Requested-By` header, and if the request
@@ -483,13 +536,52 @@ the header.
 
 | Method | Path | Purpose |
 | --- | --- | --- |
-| `POST` | `/thermostat/away` | Away mode on |
+| `POST` | `/thermostat/away` | Away mode on; optional JSON body `{"returnAt": "<ISO time>"}` |
+| `POST` | `/thermostat/return` | While away: set (`{"returnAt": "<ISO time>"}`) or clear (`{"returnAt": null}`) the return time |
 | `POST` | `/thermostat/home` | Away mode off; restores the previous setting |
-| `GET` | `/thermostat/status` | Away state, last reading, outdoor/forecast temps, predicted rate and model, recent learned runs |
+| `GET` | `/thermostat/status` | Away state and return time, last reading, outdoor/forecast temps, predicted rate and model, recent learned runs |
 
 ```sh
 curl -X POST -H "X-Requested-By: me" http://pi.local:8787/thermostat/away
 ```
+
+### Water heater (Rheem EcoNet)
+
+A Rheem heat pump water heater follows away mode (`water-heater.mjs` for the
+schedule, `econet.mjs` for the API):
+
+| When | Water heater |
+| --- | --- |
+| Away mode on | Off (fully off, not Vacation) |
+| 23:00 the night before the return time | On, Energy Saver, 140°F |
+| 06:00 after that | 120°F (Energy Saver) |
+| "I'm home" before the schedule started, off-peak | On at 140°F now, 120°F at the next 06:00 |
+| "I'm home", or back the same day, during peak hours | Off until 23:00 that day, then 140°F; 120°F at the next 06:00 |
+| Home, nothing scheduled | Left alone |
+
+So a 5 PM Sunday return turns it on at 11 PM Saturday and drops it to 120°F
+at 6 AM Sunday. If the night before has already passed, it never heats the
+tank at peak prices: off-peak (23:00–07:00) it comes on straight away, and
+during peak hours it waits for 23:00 that day, even with you home. The
+schedule outlasts away mode, since the 06:00 drop often comes after you're
+back.
+
+**Retries.** The heater's Wi-Fi is weak, and Rheem's cloud never acknowledges a
+command, so nothing counts as done until the heater **reports** it. Each
+attempt sends only what's still different, then re-reads after 30 s, 1 min,
+2 min, 5 min, then every 10 minutes until it matches. Every attempt is logged,
+and after 6 the log entries become errors. While EcoNet shows the heater
+offline it waits rather than send into the void. Once confirmed it re-reads
+every 30 minutes, in case someone changed it in the app. Sign-in and network
+failures retry on the same schedule.
+
+**Unofficial API.** Rheem has no public or local API. `econet.mjs` follows
+[pyeconet](https://github.com/w1ll1am23/pyeconet), the library behind Home
+Assistant's EcoNet integration: REST at `rheem.rheemconnect.com` to sign in
+and read the equipment, and MQTT on port 1884 to send commands, using the
+EcoNet app's own client keys. It can break whenever Rheem changes the app.
+`ECONET_EMAIL` / `ECONET_PASSWORD` are your EcoNet app login, and live only in
+the Pi's `.env`.
 
 ### Dashboard
 
@@ -511,7 +603,8 @@ Remote access over the VPNs is intended. It shows:
 - the heat pump's kWh per hour, split into off-peak and peak hours, with
   Leviton's cost estimate
 - every learned warm-up run
-- an Away / I'm home switch
+- an Away / I'm home switch, and while away a **Back home** date and time
+- the water heater: what it reports, and what it's being brought to
 
 It refreshes every minute. Its data comes from `GET /thermostat/status` and
 `GET /thermostat/history?hours=N`.

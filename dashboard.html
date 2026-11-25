@@ -104,6 +104,12 @@
   details summary { cursor: pointer; color: var(--text-2); font-size: 13px; margin-top: 8px; }
   .scroll { overflow-x: auto; max-height: 320px; overflow-y: auto; }
   .err { color: var(--critical); font-size: 13px; }
+  .return { margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--grid); }
+  .return label { font-size: 13px; color: var(--text-2); font-weight: 600; }
+  input[type="datetime-local"] {
+    font: inherit; font-size: 14px; border-radius: 8px; border: 1px solid var(--border);
+    background: var(--surface); color: var(--text); padding: 5px 8px; min-width: 0; max-width: 100%;
+  }
   .totals { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; margin-top: 12px; }
   .totals div { font-size: 13px; color: var(--text-2); }
   .totals strong { display: block; font-size: 20px; color: var(--text); font-variant-numeric: tabular-nums; }
@@ -131,6 +137,7 @@ store.del("heatpump-dashboard-token"); // left over from when the page asked for
 
 let rangeHours = parseInt(store.get(RANGE_KEY) || "48", 10);
 let status = null, history = null, lastError = null, timer = null;
+let renderPending = false, returnDraft = null; // the return time being edited, if any
 
 // --- tiny DOM helpers (all text via textContent) ---------------------------
 function el(tag, attrs = {}, ...kids) {
@@ -171,6 +178,8 @@ async function load() {
   } catch (err) {
     lastError = err.message;
   }
+  // A refresh mid-edit would wipe the return time being picked; catch up on blur.
+  if (document.activeElement?.id === "return-at") { renderPending = true; return; }
   render();
 }
 
@@ -198,12 +207,23 @@ function render() {
     awayButton());
 
   const tiles = el("div", { class: "tiles" },
-    tile("Indoor", deg(dev?.indoorF), dev ? `Setpoint ${deg(dev.targetF)}` : ""),
+    indoorTile(dev, last?.indoor),
     tile("Outdoor", deg(last?.outdoorF), last?.forecastF != null ? `Rest of tonight ~${deg(last.forecastF)}` : "No forecast"),
     unitTile(dev),
-    breakerTile(status.breaker));
+    breakerTile(status.breaker),
+    status.waterHeater?.enabled ? waterHeaterTile(status.waterHeater) : null);
 
   app.replaceChildren(header, tiles, planCard(), tempCard(), energyCard(), runsCard());
+}
+
+// The room sensor when it's in use (to a tenth), with the unit's own reading beside it.
+function indoorTile(dev, indoor) {
+  const setpoint = dev ? `Setpoint ${deg(dev.targetF)}` : "";
+  if (!indoor?.room) return tile("Indoor", deg(dev?.indoorF), setpoint);
+  if (indoor.source === "room") {
+    return tile(indoor.room.name, dev && Number.isFinite(dev.indoorF) ? `${dev.indoorF.toFixed(1)}°` : "–", `Unit's sensor ${deg(indoor.unitIndoorF)} · ${setpoint}`);
+  }
+  return tile("Indoor (unit's sensor)", deg(dev?.indoorF), `${indoor.room.name} sensor unavailable: ${indoor.room.error || "no reading"}`);
 }
 
 function tile(label, value, sub, extra) {
@@ -216,14 +236,34 @@ function statusPill(color, text) {
 
 function unitTile(dev) {
   if (status.away) {
-    return tile("Unit", "Away", `Never below ${status.settings.awayMinF}° · since ${fmtWhen(new Date(status.awaySince))}`,
-      statusPill(status.awayHeating ? "var(--series-2)" : "var(--text-3)", status.awayHeating ? "Heating" : "Off"));
+    const heating = status.awayHeating ? (status.awayRun === "return" ? "Warming up for your return" : "Heating") : "Off";
+    return tile("Unit", "Away",
+      status.returnAt ? `Back ${fmtWhen(new Date(status.returnAt))}` : `Never below ${status.settings.awayMinF}° · since ${fmtWhen(new Date(status.awaySince))}`,
+      statusPill(status.awayHeating ? "var(--series-2)" : "var(--text-3)", heating));
   }
   if (!dev) return tile("Unit", "–", "");
   const on = dev.power;
   const mode = dev.mode ? dev.mode[0] + dev.mode.slice(1).toLowerCase() : "";
   return tile("Unit", on ? mode : "Off", on ? `to ${deg(dev.targetF)}` : `${mode} mode, ${deg(dev.targetF)} when on`,
     on ? statusPill("var(--good)", "Running") : null);
+}
+
+// What the heater last reported, and what it's being brought to if that differs.
+function waterHeaterTile(wh) {
+  const r = wh.reported?.state;
+  const pretty = (m) => (m ? m.toLowerCase().replace(/_/g, " ").replace(/^./, (c) => c.toUpperCase()) : "");
+  const value = !r ? "–" : r.enabled ? `${r.setpointF}°` : "Off";
+  const want = wh.desired;
+  const matches = r && want && (want.enabled ? r.enabled && r.mode === want.mode && r.setpointF === want.setpointF : r.enabled === false);
+  let sub;
+  if (want && !matches) sub = `Sending ${want.enabled ? `${want.setpointF}° ${pretty(want.mode).toLowerCase()}` : "off"}${wh.attempts ? `, attempt ${wh.attempts}` : ""}`;
+  else if (wh.schedule) sub = new Date(wh.schedule.onAt) > new Date()
+    ? `On ${fmtWhen(new Date(wh.schedule.onAt))} at ${wh.settings.boostF}°`
+    : `${wh.settings.normalF}° from ${fmtWhen(new Date(wh.schedule.dropAt))}`;
+  else sub = r?.enabled ? pretty(r.mode) : r ? "Off while away" : "Not read yet";
+  const pill = !r ? null : !r.connected ? statusPill("var(--critical)", "Offline")
+    : wh.note ? statusPill("var(--warn)", "Retrying") : statusPill(r.enabled ? "var(--good)" : "var(--text-3)", r.enabled ? "On" : "Off");
+  return tile("Water heater", value, wh.note ? `${sub} · ${wh.note}` : sub, pill);
 }
 
 // Leads with the last complete hour from Leviton's energy history: that's
@@ -250,10 +290,34 @@ function planCard() {
   let headline, detail = [];
   if (status.away) {
     const p = plan || {};
-    headline = p.bankF != null
-      ? `Away: bank to ${p.bankF}° by ${s.windowEnd}${p.startAt ? ` (from ~${fmtTime(new Date(p.startAt))})` : ""}, then coast through peak`
-      : "Away";
-    if (p.requiredF != null) {
+    const back = status.returnAt ? new Date(status.returnAt) : null;
+    // Worked out from the house as it is now: only meaningful once no bank comes first.
+    const warmFrom = p.returnStartAt && (p.bankF == null || !p.startAt || new Date(p.returnStartAt) < new Date(p.startAt)) ? new Date(p.returnStartAt) : null;
+    if (back && status.awayRun === "return") {
+      headline = `Warming up to ${s.targetF}° for your return ${fmtWhen(back)}`;
+    } else if (back && p.bankF == null) {
+      headline = `Back ${fmtWhen(back)}: ${s.targetF}° by then${warmFrom ? `, warming from ~${fmtWhen(warmFrom)}` : ""}`;
+    } else {
+      headline = p.bankF != null
+        ? `Away: bank to ${p.bankF}° by ${s.windowEnd}${p.startAt ? ` (from ~${fmtTime(new Date(p.startAt))})` : ""}, then coast${back && p.returnF != null ? " until you're back" : " through peak"}`
+        : "Away";
+    }
+    if (back && (p.bankF == null || status.awayRun === "return")) {
+      detail.push(`Away mode ends then and the heat stays on at ${s.targetF}°.`); // the headline says the rest
+    } else if (back) {
+      let r = `Back ${fmtWhen(back)}: ${s.targetF}° by then`;
+      if (warmFrom) r += `, warm-up from ~${fmtWhen(warmFrom)}`;
+      if (p.returnF != null) {
+        r += `. That takes ${p.returnF.toFixed(1)}° at ${s.windowEnd}`;
+        if (p.bankF >= Math.ceil(p.returnF)) r += ", which tonight's bank covers";
+        else if (Math.ceil(p.worthF) > p.bankF) r += `, capped at ${p.bankF}° -- a short warm-up before you arrive covers the rest`;
+        else r += ` -- at today's prices it isn't worth banking that far ahead, so the rest is heated before you arrive`;
+      } else if (!warmFrom && p.bankF != null) {
+        r += "; the warm-up time is worked out after the bank";
+      }
+      detail.push(`${r}. Away mode ends then and the heat stays on at ${s.targetF}°.`);
+    }
+    if (p.requiredF != null && p.returnF == null && p.bankF != null) {
       let why = `Coasting the whole peak needs ${p.requiredF.toFixed(1)}° at ${s.windowEnd}`;
       if (p.worthF != null && p.worthF < p.requiredF) {
         why += `; at today's prices heat is only worth banking for the first ${p.horizonHours.toFixed(1)} h of it (${p.worthF.toFixed(1)}°)`;
@@ -262,9 +326,15 @@ function planCard() {
       why += p.bankF < Math.ceil(p.requiredF) ? " -- the floor guard covers the rest of the peak." : ".";
       detail.push(why);
     }
+    const wh = status.waterHeater;
+    if (wh?.enabled) {
+      detail.push(wh.schedule
+        ? `Water heater off until ${fmtWhen(new Date(wh.schedule.onAt))}, then ${wh.settings.boostF}° until ${fmtWhen(new Date(wh.schedule.dropAt))}, then ${wh.settings.normalF}°.`
+        : `Water heater off while away${back ? "" : "; set a return time to have it back on for you"}.`);
+    }
     detail.push(`Never below ${s.awayMinF}°: heats at ${s.awayMinF + 1}° any hour, until ${s.awayMinF + 3}°.`);
     if (last?.coolingModel) detail.push(`Heat loss: ${last.coolingModel}.`);
-    detail.push("The 64° preheat is paused while away.");
+    detail.push(`The ${s.targetF}° preheat is paused while away.`);
   } else if (!status.preheatEnabled) {
     headline = "Overnight preheat is turned off";
   } else if (plan?.startAt) {
@@ -280,7 +350,48 @@ function planCard() {
   if (!status.away && s.heatOffTime) detail.push(`Heat switches off at ${s.heatOffTime} when peak power starts.`);
   if (last?.model) detail.push(`Warm-up model: ${last.model}.`);
   detail.push(`Off-peak ${s.windowStart}–${s.windowEnd}. ${status.samples} samples logged.`);
-  return el("div", { class: "card" }, el("h2", {}, "Tonight"), el("div", { class: "plan" }, headline), el("p", { class: "muted", style: "margin:6px 0 0" }, detail.join(" ")));
+  return el("div", { class: "card" }, el("h2", {}, "Tonight"), el("div", { class: "plan" }, headline),
+    el("p", { class: "muted", style: "margin:6px 0 0" }, detail.join(" ")),
+    status.away ? returnControl() : null);
+}
+
+// "YYYY-MM-DDTHH:MM" in local time, what a datetime-local input takes.
+const localInput = (d) => {
+  const p = (n) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}T${p(d.getHours())}:${p(d.getMinutes())}`;
+};
+
+// When you'll be back: the house is at the preheat target by then, and away mode ends.
+function returnControl() {
+  const saved = status.returnAt ? localInput(new Date(status.returnAt)) : "";
+  const input = el("input", {
+    type: "datetime-local", id: "return-at", "aria-label": "Back home at",
+    min: localInput(new Date()),
+    oninput: (e) => { returnDraft = e.target.value; },
+    onblur: () => { if (renderPending) { renderPending = false; setTimeout(render, 0); } },
+  });
+  input.value = returnDraft ?? saved;
+  const send = async (btn, returnAt) => {
+    btn.disabled = true;
+    try {
+      await api("/thermostat/return", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ returnAt }) });
+      returnDraft = null;
+    } catch (err) { alert(`Failed: ${err.message}`); btn.disabled = false; return; }
+    setTimeout(load, 1500);
+  };
+  const save = el("button", { class: "primary", onclick: (e) => {
+      if (!input.value) return alert("Pick a date and time first.");
+      const at = new Date(input.value); // the input is local time
+      if (!(at > new Date())) return alert("That's in the past.");
+      send(e.target, at.toISOString());
+    } }, status.returnAt ? "Update" : "Set return");
+  const clear = status.returnAt ? el("button", { onclick: (e) => { returnDraft = null; send(e.target, null); } }, "Clear") : null;
+  return el("div", { class: "return" },
+    el("div", { class: "row" }, el("label", { for: "return-at" }, "Back home"), input, save, clear),
+    el("p", { class: "muted", style: "margin:6px 0 0" },
+      status.returnAt
+        ? `The house will be ${status.settings.targetF}° when you get back, heated on off-peak power where it can be.`
+        : `Set when you'll be back and the house will be ${status.settings.targetF}° by then.`));
 }
 
 function rangePicker() {
@@ -377,6 +488,7 @@ function tempCard() {
   card.append(el("div", { class: "legend" },
     el("span", {}, el("span", { class: "key-line", style: "border-color:var(--series-1)" }), "Indoor"),
     el("span", {}, el("span", { class: "key-line", style: "border-color:var(--series-2)" }), "Outdoor"),
+    samples.some((d) => d.indoorSource === "room") ? el("span", {}, el("span", { class: "key-line key-dash", style: "border-color:var(--series-1);opacity:.5" }), "Unit's own sensor") : null,
     el("span", {}, el("span", { class: "key-line key-dash", style: "border-color:var(--setpoint)" }), "Setpoint (when on)"),
     el("span", {}, el("span", { class: "key-box", style: "background:var(--heat-band)" }), "Heating"),
     el("span", {}, el("span", { class: "key-box", style: "background:var(--offpeak-band)" }), "Off-peak")));
@@ -387,7 +499,7 @@ function tempCard() {
 
   const { from, to } = rangeBounds();
   const f = chartFrame(260);
-  const vals = samples.flatMap((d) => [d.indoorF, d.outdoorF, d.power && d.mode === "HEAT" ? d.targetF : null]).filter(Number.isFinite);
+  const vals = samples.flatMap((d) => [d.suspect ? null : d.indoorF, d.indoorSource === "room" ? d.unitIndoorF : null, d.outdoorF, d.power && d.mode === "HEAT" ? d.targetF : null]).filter(Number.isFinite);
   let lo = Math.floor((Math.min(...vals) - 2) / 5) * 5, hi = Math.ceil((Math.max(...vals) + 2) / 5) * 5;
   if (hi - lo < 10) hi = lo + 10;
   const x = (t) => ((t - from) / (to - from)) * f.iw;
@@ -418,7 +530,7 @@ function tempCard() {
   }
   timeAxis(g, x, from, to, f.ih);
 
-  const line = (key, color, dash, only) => {
+  const line = (key, color, dash, only, opacity) => {
     let dpath = "", prev = null;
     for (const d of samples) {
       const v = only && !only(d) ? null : d[key];
@@ -427,11 +539,13 @@ function tempCard() {
       dpath += `${!prev || gap ? "M" : "L"}${x(d.t).toFixed(1)},${y(v).toFixed(1)}`;
       prev = d;
     }
-    g.append(s("path", { d: dpath, fill: "none", stroke: color, "stroke-width": 2, "stroke-linejoin": "round", ...(dash ? { "stroke-dasharray": "5 4" } : {}) }));
+    g.append(s("path", { d: dpath, fill: "none", stroke: color, "stroke-width": 2, "stroke-linejoin": "round", ...(dash ? { "stroke-dasharray": "5 4" } : {}), ...(opacity ? { opacity } : {}) }));
   };
   line("targetF", "var(--setpoint)", true, (d) => d.power && d.mode === "HEAT");
   line("outdoorF", "var(--series-2)");
-  line("indoorF", "var(--series-1)");
+  // While a room sensor is in use, the unit's own reading for comparison.
+  line("unitIndoorF", "var(--series-1)", true, (d) => d.indoorSource === "room", 0.5);
+  line("indoorF", "var(--series-1)", false, (d) => !d.suspect); // defrost blips left out
 
   // Crosshair + one tooltip listing every series at the nearest sample.
   const hair = s("line", { y1: 0, y2: f.ih, stroke: "var(--text-3)", "stroke-width": 1, visibility: "hidden" });
@@ -449,14 +563,16 @@ function tempCard() {
     const bx = x(best.t);
     hair.setAttribute("x1", bx); hair.setAttribute("x2", bx); hair.setAttribute("visibility", "visible");
     for (const [dot, key] of [[dotIn, "indoorF"], [dotOut, "outdoorF"]]) {
-      if (Number.isFinite(best[key])) { dot.setAttribute("cx", bx); dot.setAttribute("cy", y(best[key])); dot.setAttribute("visibility", "visible"); }
+      if (Number.isFinite(best[key]) && !(key === "indoorF" && best.suspect)) { dot.setAttribute("cx", bx); dot.setAttribute("cy", y(best[key])); dot.setAttribute("visibility", "visible"); }
       else dot.setAttribute("visibility", "hidden");
     }
     const row = (color, value, label, dash) => el("div", { class: "r" },
       el("span", { class: `key-line${dash ? " key-dash" : ""}`, style: `border-color:${color}` }), el("strong", {}, value), el("span", { class: "muted" }, label));
     setTip(f.tip,
       el("div", { class: "t" }, fmtWhen(new Date(best.t))),
-      row("var(--series-1)", deg(best.indoorF), "Indoor"),
+      row("var(--series-1)", best.indoorSource === "room" ? `${best.indoorF.toFixed(1)}°` : deg(best.indoorF),
+        best.suspect ? "Indoor (ignored -- defrost blip)" : best.indoorSource === "room" ? "Room sensor" : "Indoor"),
+      best.indoorSource === "room" ? row("var(--series-1)", deg(best.unitIndoorF), "Unit's own sensor", true) : null,
       row("var(--series-2)", deg(best.outdoorF), "Outdoor"),
       row("var(--setpoint)", best.power ? `${best.mode?.toLowerCase()} ${deg(best.targetF)}` : "off", "Unit", true),
       best.away ? el("div", { class: "muted" }, "Away mode") : null);
@@ -470,7 +586,7 @@ function tempCard() {
 
   // Table view.
   const rows = samples.slice().reverse().map((d) => el("tr", {},
-    el("td", {}, fmtWhen(new Date(d.t))), el("td", {}, deg(d.indoorF)), el("td", {}, deg(d.outdoorF)),
+    el("td", {}, fmtWhen(new Date(d.t))), el("td", {}, d.suspect ? `${deg(d.indoorF)} (ignored)` : deg(d.indoorF)), el("td", {}, deg(d.outdoorF)),
     el("td", {}, d.power ? `${d.mode} ${deg(d.targetF)}` : "Off"), el("td", {}, d.away ? "Yes" : "")));
   card.append(el("details", {}, el("summary", {}, "Show readings as a table"),
     el("div", { class: "scroll" }, el("table", {}, el("thead", {}, el("tr", {}, ...["Time", "Indoor", "Outdoor", "Unit", "Away"].map((h) => el("th", {}, h)))), el("tbody", {}, rows)))));

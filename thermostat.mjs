@@ -79,7 +79,58 @@ export const DEFAULTS = {
   coolingSafety: 1.25,
   minCoolingK: 0.005,
   maxCoolingK: 0.2,
+
+  /**
+   * Indoor readings this far below the last trusted one are defrost blips,
+   * not the house -- unless they last indoorConfirmMinutes. See trustedSamples().
+   */
+  maxIndoorDropF: 3,
+  indoorConfirmMinutes: 30,
+
+  /** A room sensor not heard from in this long is ignored for the unit's own reading. */
+  roomSensorMaxAgeMinutes: 30,
 };
+
+// --- Room sensor -----------------------------------------------------------------
+
+/**
+ * Which reading a sample's indoorF came from: "room" (a Dirigera sensor) or
+ * "unit" (the heat pump's own). Samples from before room sensors are "unit".
+ * The two sit a degree or two apart, so a warm-up, cool-down or bad-reading
+ * check never spans a switch between them.
+ */
+export const indoorSource = (s) => s.indoorSource || "unit";
+
+/**
+ * The Dirigera environment sensor called `want`: by its name or its room's,
+ * ignoring case, an exact match before a partial one. Only sensors that
+ * report a temperature count (an air purifier's sensor may not).
+ */
+export function findRoomSensor(sensors, want) {
+  const w = String(want || "").trim().toLowerCase();
+  if (!w) return null;
+  const withTemp = (sensors || []).filter((d) => Number.isFinite(d?.attributes?.currentTemperature));
+  const names = (d) => [d.attributes.customName, d.room?.name].filter(Boolean).map((n) => n.toLowerCase());
+  return withTemp.find((d) => names(d).includes(w)) || withTemp.find((d) => names(d).some((n) => n.includes(w))) || null;
+}
+
+/**
+ * A room sensor's temperature in °F (to 0.1), or why it can't be used: not
+ * reachable, no reading, or not heard from in maxAgeMinutes.
+ *
+ * @returns {{indoorF: number, at: string} | {error: string}}
+ */
+export function roomSensorF(sensor, now = new Date(), { maxAgeMinutes = DEFAULTS.roomSensorMaxAgeMinutes } = {}) {
+  if (!sensor) return { error: "sensor not found" };
+  const c = sensor.attributes?.currentTemperature;
+  if (!Number.isFinite(c)) return { error: "no temperature reading" };
+  if (sensor.isReachable === false) return { error: "not reachable" };
+  const seen = Date.parse(sensor.lastSeen);
+  if (!Number.isFinite(seen)) return { error: "no last-seen time" };
+  const ageMin = (+now - seen) / 60000;
+  if (ageMin > maxAgeMinutes) return { error: `last heard from ${Math.round(ageMin)} min ago` };
+  return { indoorF: Math.round((c * 9) / 5 * 10 + 320) / 10, at: sensor.lastSeen };
+}
 
 // --- Off-peak window ---------------------------------------------------------
 
@@ -101,6 +152,41 @@ function hm(hhmm) {
   return [d.getHours(), d.getMinutes()];
 }
 
+// --- Bad readings --------------------------------------------------------------
+
+/**
+ * Drop indoor readings that can't be real.
+ *
+ * While it heats in cold weather the unit now and then reports the house
+ * 9-30°F colder for 5-10 minutes (36, 37, then 63; 64, 32, 57, then 64) --
+ * most likely the sensor catching cold air during a defrost cycle. A house
+ * can't lose heat that fast: the real drop right after a run stops is a degree
+ * or two. So a reading more than maxDropF below the last trusted one is
+ * dropped, unless the house is still reading that low confirmMs later (a door
+ * left open in January), and then it's believed. Rises are always believed:
+ * the air warms fast while the unit runs.
+ *
+ * A switch between the room sensor and the unit's own reading starts afresh.
+ * Samples without a reading pass through unchanged. Returns a new array; the
+ * history on disk keeps every raw reading.
+ *
+ * @param {Array<{t: string|number, indoorF: number}>} samples  oldest first
+ */
+export function trustedSamples(samples, { maxDropF = DEFAULTS.maxIndoorDropF, confirmMs = DEFAULTS.indoorConfirmMinutes * 60 * 1000 } = {}) {
+  const out = [];
+  let trusted = null;
+  for (const s of samples) {
+    if (!Number.isFinite(s.indoorF)) {
+      out.push(s);
+      continue;
+    }
+    if (trusted && indoorSource(trusted) === indoorSource(s) && trusted.indoorF - s.indoorF > maxDropF && time(s) - time(trusted) < confirmMs) continue;
+    trusted = s;
+    out.push(s);
+  }
+  return out;
+}
+
 // --- Learning the warm-up rate -----------------------------------------------
 
 /**
@@ -108,8 +194,8 @@ function hm(hhmm) {
  *
  * A run is a stretch of consecutive samples with the unit on in HEAT, starting
  * below its setpoint. It ends at the first sample at or above the setpoint, or
- * where the unit is switched off, changes mode or setpoint, or the samples have
- * a gap. Short runs and runs that barely needed to lift are dropped: readings
+ * where the unit is switched off, changes mode or setpoint, the indoor reading
+ * switches sensor, or the samples have a gap. Short runs and runs that barely needed to lift are dropped: readings
  * are whole degrees, so they say little.
  *
  * Every heating run counts, not just our preheats -- a run you started by hand
@@ -144,7 +230,7 @@ export function extractWarmups(samples, { maxGapMs = 20 * 60 * 1000, minMinutes 
   for (const s of samples) {
     if (run) {
       const prev = run.samples[run.samples.length - 1];
-      if (!heating(s) || s.targetF !== run.first.targetF || time(s) - time(prev) > maxGapMs) {
+      if (!heating(s) || s.targetF !== run.first.targetF || indoorSource(s) !== indoorSource(run.first) || time(s) - time(prev) > maxGapMs) {
         close(prev);
       } else {
         run.samples.push(s);
@@ -265,7 +351,7 @@ export function extractCooldowns(samples, { maxGapMs = 20 * 60 * 1000, minMinute
 
   for (const s of samples) {
     const prev = seg[seg.length - 1];
-    if (!usable(s) || (prev && time(s) - time(prev) > maxGapMs)) close();
+    if (!usable(s) || (prev && (time(s) - time(prev) > maxGapMs || indoorSource(s) !== indoorSource(prev)))) close();
     if (usable(s)) seg.push(s);
   }
   close();
@@ -386,8 +472,11 @@ export function preheatStart({
  *
  * Heat-off fires once a day too (state.heatOffKey = that day's date).
  *
- * @returns {{action: "idle"|"preheat"|"preheat-skip"|"heat-off"|"heat-off-skip"|"away-heat-on"|"away-heat-off", reason: string, startAt?: Date,
- *   minutesNeeded?: number, key?: string, run?: "bank"|"guard", setpointF?: number, bankF?: number, requiredF?: number}}
+ * In away mode `state.returnAt` (ISO) is when you'll be back; see planAway().
+ *
+ * @returns {{action: "idle"|"preheat"|"preheat-skip"|"heat-off"|"heat-off-skip"|"away-heat-on"|"away-heat-off"|"away-end", reason: string,
+ *   startAt?: Date, minutesNeeded?: number, key?: string, run?: "bank"|"guard"|"return", setpointF?: number, bankF?: number|null,
+ *   requiredF?: number, returnAt?: Date|null, returnStartAt?: Date|null, returnF?: number|null}}
  */
 export function planThermostat({
   now,
@@ -460,11 +549,27 @@ export function planThermostat({
  *   3. Coast (peak, and off-peak before the start time): the unit stays off.
  *      Anything running that isn't an unfinished guard run is switched off.
  *
+ * With a return time (state.returnAt) set:
+ *
+ *   - Warm-up for your return comes first: the house is heated to targetF
+ *     (64°F) to arrive just as you do, timed like the preheat, and held there.
+ *   - The bank also aims to have the house at targetF when you get back, if
+ *     that's in the coming peak and banking that far still pays -- so
+ *     the warm-up before you arrive is a top-up, not a peak-priced climb
+ *     from the floor. Back during or before tonight's off-peak, no bank.
+ *   - At the return time away mode ends ("away-end"), leaving the heat on at
+ *     targetF. Home mode takes over from there.
+ *
  * It owns the unit while away. With no reading it does nothing rather than guess.
  */
 function planAway({ now, device, state, ratePerHour, coolingK, hourly, outdoorF, prices, o }) {
+  const back = state.returnAt && Number.isFinite(Date.parse(state.returnAt)) ? new Date(state.returnAt) : null;
+  if (back && now >= back) {
+    return { action: "away-end", returnAt: back, reason: `away: back as of ${fmtLocal(back)} -- away mode off, heat on at ${o.targetF}°F` };
+  }
+
   const T = device?.indoorF;
-  if (!Number.isFinite(T)) return { action: "idle", reason: "away: no indoor reading" };
+  if (!Number.isFinite(T)) return { action: "idle", returnAt: back, reason: "away: no indoor reading" };
 
   const heatingNow = device.power && device.mode === "HEAT";
   const ours = heatingNow && !!state.awayHeating;
@@ -477,34 +582,71 @@ function planAway({ now, device, state, ratePerHour, coolingK, hourly, outdoorF,
   const window = offPeakWindow(now, o.windowStart, o.windowEnd);
   const peakEnd = offPeakWindow(window.end, o.windowStart, o.windowEnd).start;
   const k = coolingK * o.coolingSafety;
-  const coastTo = (to) =>
+  const coastTo = (to, endF) =>
     awayBankTarget({
       hourly,
       from: window.end,
       to,
       k,
-      endF: o.awayMinF + o.awayMarginF,
+      endF,
       fallbackOutdoorF: Number.isFinite(outdoorF) ? outdoorF : o.refOutdoorF,
     });
-  // What coasting the whole peak takes, and what's worth banking at these prices.
-  const requiredF = coastTo(peakEnd);
+  // Back during the coming peak: the house only has to stay above the floor until then.
+  const backInPeak = back && back > window.end && back <= peakEnd;
+  const floorTo = backInPeak ? back : peakEnd;
+  // What coasting the peak takes, and what's worth banking at these prices.
+  const floorEndF = o.awayMinF + o.awayMarginF;
+  let requiredF = coastTo(floorTo, floorEndF);
   const horizonHours = bankHorizonHours({ prices, k, copRatio: o.awayCopRatio });
-  const horizonEnd = Math.min(+peakEnd, +window.end + horizonHours * MS_PER_HOUR);
-  const worthF = horizonEnd < +peakEnd ? coastTo(new Date(horizonEnd)) : requiredF;
-  const bankF = Math.min(o.awayMaxBankF, Math.max(guardOff, Math.ceil(worthF)));
-  const { startAt, minutesNeeded } = preheatStart({
-    indoorF: T,
-    ratePerHour,
-    window,
-    targetF: bankF,
-    safety: o.safety,
-    marginMinutes: o.marginMinutes,
-    latestStart: o.latestStart,
-  });
-  const plan = { bankF, requiredF, worthF, horizonHours: Number.isFinite(horizonHours) ? horizonHours : null, startAt, minutesNeeded, key: window.key };
+  const horizonEnd = Math.min(+floorTo, +window.end + horizonHours * MS_PER_HOUR);
+  let worthF = horizonEnd < +floorTo ? coastTo(new Date(horizonEnd), floorEndF) : requiredF;
+  // ...and what it takes to still be at targetF when you walk in, if that pays.
+  let returnF = null;
+  if (backInPeak) {
+    returnF = coastTo(back, o.targetF);
+    requiredF = Math.max(requiredF, returnF);
+    if (+back <= +window.end + horizonHours * MS_PER_HOUR) worthF = Math.max(worthF, returnF);
+  }
+  // Back by the end of tonight's off-peak: the warm-up for your return does it all.
+  const bankF = back && back <= window.end ? null : Math.min(o.awayMaxBankF, Math.max(guardOff, Math.ceil(worthF)));
+  const { startAt, minutesNeeded } =
+    bankF == null
+      ? {}
+      : preheatStart({
+          indoorF: T,
+          ratePerHour,
+          window,
+          targetF: bankF,
+          safety: o.safety,
+          marginMinutes: o.marginMinutes,
+          latestStart: o.latestStart,
+        });
+  // The warm-up for your return, worked back from when you're back like the preheat.
+  const returnMinutes = back ? (Math.max(0, o.targetF - T) / ratePerHour) * 60 * o.safety + o.marginMinutes : null;
+  const returnStartAt = back ? new Date(+back - returnMinutes * 60 * 1000) : null;
+  const plan = {
+    bankF,
+    requiredF,
+    worthF,
+    returnF,
+    horizonHours: Number.isFinite(horizonHours) ? horizonHours : null,
+    startAt,
+    minutesNeeded,
+    returnAt: back,
+    returnStartAt,
+    returnMinutes,
+    key: window.key,
+  };
   const on = (runKind, target, reason) => ({ ...plan, action: "away-heat-on", run: runKind, setpointF: setpoint(target), reason });
   const off = (reason) => ({ ...plan, action: "away-heat-off", reason });
   const idle = (reason) => ({ ...plan, action: "idle", reason });
+
+  // 0. Warm-up for your return. Like the bank, a run under way keeps going as
+  // its start time moves later; at targetF the unit holds it on its own.
+  if (back && (now >= returnStartAt || run === "return")) {
+    if (run === "return") return idle(`away: warming up for your return at ${fmtLocal(back)} (${T}°F -> ${o.targetF}°F)`);
+    return on("return", o.targetF, `away: back at ${fmtLocal(back)} -- warming ${T}°F -> ${o.targetF}°F`);
+  }
 
   // 1. Floor guard.
   if (T <= guardOn) {
@@ -514,7 +656,7 @@ function planAway({ now, device, state, ratePerHour, coolingK, hourly, outdoorF,
 
   // 2. Bank. A bank run under way keeps going: its start time, re-worked from a
   // house it has already warmed, has moved later than now.
-  if (window.inWindow && (now >= startAt || run === "bank")) {
+  if (bankF != null && window.inWindow && (now >= startAt || run === "bank")) {
     if (T >= bankF) return device.power ? off(`away: banked ${T}°F (target ${bankF}°F)`) : idle(`away: banked (${T}°F)`);
     if (ours && run === "bank") return idle(`away: banking ${T}°F -> ${bankF}°F`);
     // Start the bank below it -- or take over a guard run so it goes on to the bank target.
@@ -525,7 +667,25 @@ function planAway({ now, device, state, ratePerHour, coolingK, hourly, outdoorF,
   // 3. Coast.
   if (run === "guard" && T < guardOff) return idle(`away: guard heating (${T}°F -> ${guardOff}°F)`);
   if (device.power) return off(`away: coasting -- ${window.inWindow ? "bank starts later" : "peak hours"} (${T}°F)`);
+  if (bankF == null) return idle(`away: coasting (${T}°F) until the warm-up for your return at ${fmtLocal(back)}`);
   return idle(`away: coasting (${T}°F, bank ${bankF}°F ${window.inWindow ? "from" : "after"} ${window.inWindow ? "the start time" : o.windowStart})`);
+}
+
+/** "2026-11-29 17:00", local. */
+function fmtLocal(d) {
+  return `${localDateKey(d)} ${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
+}
+
+/**
+ * Check a return time from the dashboard: a parseable time in the future, and
+ * not absurdly far off. Returns the Date, or throws with a reason to show.
+ */
+export function parseReturnAt(value, now = new Date(), { maxDays = 90 } = {}) {
+  const d = new Date(value);
+  if (value == null || value === "" || !Number.isFinite(+d)) throw new Error("returnAt must be a date and time");
+  if (d <= now) throw new Error("returnAt must be in the future");
+  if (+d - +now > maxDays * 24 * MS_PER_HOUR) throw new Error(`returnAt must be within ${maxDays} days`);
+  return d;
 }
 
 // --- Outdoor forecast --------------------------------------------------------

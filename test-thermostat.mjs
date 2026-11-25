@@ -13,6 +13,10 @@ import {
   fitCoolingModel,
   awayBankTarget,
   bankHorizonHours,
+  trustedSamples,
+  parseReturnAt,
+  findRoomSensor,
+  roomSensorF,
   DEFAULTS,
 } from "./thermostat.mjs";
 import { summarizeAcState } from "./thinq.mjs";
@@ -474,6 +478,180 @@ test("away: replaces a non-heat mode when the floor needs heat", () => {
 test("away: suppresses the overnight preheat, and no reading -> nothing", () => {
   assert.notEqual(awayPlan(at(19, 3), 60).action, "preheat");
   assert.equal(awayPlan(at(19, 3), null).action, "idle");
+});
+
+// --- Away: return time -------------------------------------------------------------
+
+test("return: warms the house to 64 to arrive just as you do", () => {
+  const back = { returnAt: at(19, 17).toISOString() };
+  // From 60 at 1°F/h: 4h x 1.2 + 15min = 303 min before 17:00 -> 11:57.
+  const before = awayPlan(at(19, 11, 55), 60, {}, back);
+  assert.equal(before.action, "idle");
+  assert.equal(hhmm(before.returnStartAt), "11:57");
+  const go = awayPlan(at(19, 11, 57), 60, {}, back);
+  assert.equal(go.action, "away-heat-on");
+  assert.equal(go.run, "return");
+  assert.equal(go.setpointF, 64);
+});
+
+test("return: a warm-up under way keeps going, and holds 64 once there", () => {
+  const running = { returnAt: at(19, 17).toISOString(), awayHeating: true, awayRun: "return" };
+  assert.equal(awayPlan(at(19, 13), 62, { power: true }, running).action, "idle", "start time moved later -- still warming");
+  assert.equal(awayPlan(at(19, 16), 64, { power: true }, running).action, "idle", "at 64 -- the unit holds it");
+  // Even at the floor, it isn't swapped for a guard run.
+  assert.equal(awayPlan(at(19, 13), 49, { power: true }, running).action, "idle");
+});
+
+test("return: a due warm-up takes over a guard run, or starts from the floor", () => {
+  const back = { returnAt: at(19, 17).toISOString() };
+  const fromGuard = awayPlan(at(19, 14), 50, { power: true }, { ...back, awayHeating: true, awayRun: "guard" });
+  assert.equal(fromGuard.run, "return");
+  assert.equal(fromGuard.setpointF, 64);
+  assert.equal(awayPlan(at(19, 14), 49, {}, back).run, "return");
+});
+
+test("return: at the return time, away mode ends", () => {
+  const back = { returnAt: at(19, 17).toISOString() };
+  assert.equal(awayPlan(at(19, 17), 64, { power: true }, back).action, "away-end");
+  assert.equal(awayPlan(at(20, 3), null, {}, back).action, "away-end", "even with no reading, and late");
+});
+
+test("return: back in the coming peak -> bank enough to still be at 64 then", () => {
+  const none = awayPlan(at(19, 1), 52);
+  const back = awayPlan(at(19, 1), 52, {}, { returnAt: at(19, 17).toISOString() });
+  // 40 + 24 x e^(0.0125 x 10) = 67.2 -> 68
+  assert.ok(Math.abs(back.returnF - (40 + 24 * Math.exp(0.0125 * 10))) < 1e-9);
+  assert.equal(back.bankF, 68);
+  assert.ok(back.bankF > none.bankF);
+  // 16°F at 1°F/h needs all night: it starts now, with 68 as the setpoint.
+  assert.equal(none.action, "idle");
+  assert.equal(back.action, "away-heat-on");
+  assert.equal(back.run, "bank");
+  assert.equal(back.setpointF, 68);
+});
+
+test("return: a bank for the return is capped like any other", () => {
+  const cold = Array.from({ length: 96 }, (_, h) => ({ time: +at(18, 0) + h * 3600000, tempF: 0 }));
+  const p = awayPlan(at(19, 1), 52, {}, { returnAt: at(19, 22).toISOString() }, { hourly: cold, coolingK: 0.03 });
+  assert.equal(p.bankF, DEFAULTS.awayMaxBankF);
+});
+
+test("return: when it isn't worth banking that far ahead, the warm-up does it on the day", () => {
+  // Leaky house: heat banked at 07:00 is mostly gone by 21:00.
+  const leaky = { coolingK: 0.12, prices: { offPeak: 0.059, onPeak: 0.2021 } };
+  const late = awayPlan(at(19, 1), 52, {}, { returnAt: at(19, 21).toISOString() }, leaky);
+  assert.ok(late.horizonHours < 14);
+  assert.ok(late.bankF < Math.ceil(late.returnF), `${late.bankF} vs ${late.returnF}`);
+});
+
+test("return: back during tonight's off-peak -> no bank, just the warm-up", () => {
+  const p = awayPlan(at(19, 0, 30), 52, {}, { returnAt: at(19, 5).toISOString() });
+  assert.equal(p.bankF, null);
+  assert.equal(p.action, "away-heat-on", "12°F at 1°F/h needs well over 4.5h -- start now");
+  assert.equal(p.run, "return");
+  const later = awayPlan(at(18, 14), 60, {}, { returnAt: at(18, 22).toISOString() });
+  assert.equal(later.bankF, null, "back this evening, before tonight's window");
+  assert.equal(later.action, "idle");
+  assert.match(later.reason, /warm-up for your return/);
+});
+
+test("return: days away -> tonight's bank is the usual one", () => {
+  const none = awayPlan(at(19, 1), 52);
+  const far = awayPlan(at(19, 1), 52, {}, { returnAt: at(23, 17).toISOString() });
+  assert.equal(far.bankF, none.bankF);
+  assert.equal(far.requiredF, none.requiredF);
+  assert.equal(far.action, none.action);
+});
+
+test("return: the time must be real, in the future, and within 90 days", () => {
+  const now = at(19, 12);
+  assert.equal(+parseReturnAt(at(20, 17).toISOString(), now), +at(20, 17));
+  assert.throws(() => parseReturnAt("next tuesday", now), /date and time/);
+  assert.throws(() => parseReturnAt(null, now), /date and time/);
+  assert.throws(() => parseReturnAt(at(19, 11).toISOString(), now), /future/);
+  assert.throws(() => parseReturnAt(new Date(+now + 91 * 86400000).toISOString(), now), /90 days/);
+});
+
+// --- Bad readings ------------------------------------------------------------------
+
+// Readings 5 minutes apart starting 02:06 on the 19th, as the unit reported them.
+const seq = (temps, extra = {}) => temps.map((indoorF, i) => ({ t: +at(19, 2, 6) + i * 5 * 60000, power: true, mode: "HEAT", indoorF, targetF: 64, ...extra }));
+const kept = (samples) => trustedSamples(samples).map((s) => s.indoorF);
+
+test("readings: the defrost blips seen on the Pi are dropped", () => {
+  assert.deepEqual(kept(seq([64, 64, 64, 36, 37, 63, 64])), [64, 64, 64, 63, 64]);
+  assert.deepEqual(kept(seq([65, 65, 64, 32, 57, 64, 65])), [65, 65, 64, 64, 65], "the half-recovered 57 too");
+  assert.deepEqual(kept(seq([55, 55, 56, 47, 56, 56, 57])), [55, 55, 56, 56, 56, 57]);
+});
+
+test("readings: the real drop after a run stops, and rises, are kept", () => {
+  assert.deepEqual(kept(seq([57, 56, 55, 56, 55], { power: false })), [57, 56, 55, 56, 55]);
+  assert.deepEqual(kept(seq([50, 55, 60])), [50, 55, 60]);
+});
+
+test("readings: a drop that lasts half an hour is believed", () => {
+  const s = seq([60, 52, 52, 52, 52, 52, 52, 52, 52], { power: false });
+  // 52 at +5..+30 min after the trusted 60: dropped until it's 30 min on.
+  assert.deepEqual(kept(s), [60, 52, 52, 52]);
+  // ...and after a gap of half an hour (a restart), the first reading counts.
+  const gap = [{ t: +at(19, 1), indoorF: 60 }, { t: +at(19, 2), indoorF: 52 }];
+  assert.deepEqual(kept(gap), [60, 52]);
+});
+
+test("readings: samples without a reading pass through", () => {
+  assert.deepEqual(kept(seq([60, null, 59])), [60, null, 59]);
+});
+
+test("readings: a blip at the end of a warm-up doesn't spoil the learned rate", () => {
+  // 53 -> 57 over an hour, then a defrost blip on the last sample before switch-off.
+  const s = seq([53, 54, 54, 55, 55, 55, 56, 56, 56, 56, 57, 57, 47], { targetF: 60 });
+  s.push({ ...s[s.length - 1], t: s[s.length - 1].t + 5 * 60000, power: false, indoorF: 57 });
+  const raw = extractWarmups(s);
+  const clean = extractWarmups(trustedSamples(s));
+  assert.ok(raw[0].ratePerHour < 0, "the blip reads as the house cooling while heating");
+  assert.ok(Math.abs(clean[0].ratePerHour - 4 / (55 / 60)) < 1e-9);
+});
+
+// --- Room sensor ---------------------------------------------------------------------
+
+// As the hub lists them (trimmed): the bedroom ALPSTUGA, and the office one that dropped off.
+const bedroom = { id: "52f9_1", deviceType: "environmentSensor", isReachable: true, lastSeen: "2026-11-24T23:49:44.000Z", room: { name: "Primary Bedroom" },
+  attributes: { customName: "Primary bedroom Air Quali", model: "ALPSTUGA air quality monitor", currentTemperature: 11.550000190734863, currentRH: 44 } };
+const office = { id: "1649_1", deviceType: "environmentSensor", isReachable: false, lastSeen: "2026-11-19T13:49:28.000Z", room: { name: "Office" },
+  attributes: { customName: "Office Air Quality", currentTemperature: 17.58 } };
+const noTemp = { id: "x", room: { name: "Primary Bedroom" }, attributes: { customName: "Bedroom purifier" } };
+
+test("room sensor: found by room or by name, exact before partial, and only with a temperature", () => {
+  assert.equal(findRoomSensor([noTemp, office, bedroom], "Primary Bedroom"), bedroom);
+  assert.equal(findRoomSensor([office, bedroom], "primary bedroom air quali"), bedroom);
+  assert.equal(findRoomSensor([office, bedroom], "office"), office);
+  assert.equal(findRoomSensor([office, bedroom], "bedroom"), bedroom, "partial");
+  assert.equal(findRoomSensor([office, bedroom], "Kitchen"), null);
+  assert.equal(findRoomSensor([office, bedroom], ""), null);
+});
+
+test("room sensor: °C to °F to a tenth, while it's fresh and reachable", () => {
+  const now = new Date("2026-11-24T23:52:00.000Z");
+  assert.deepEqual(roomSensorF(bedroom, now), { indoorF: 52.8, at: bedroom.lastSeen });
+  assert.match(roomSensorF(office, now).error, /not reachable/);
+  assert.match(roomSensorF({ ...bedroom, lastSeen: "2026-11-24T23:00:00.000Z" }, now).error, /52 min ago/);
+  assert.match(roomSensorF(noTemp, now).error, /no temperature/);
+  assert.match(roomSensorF(null, now).error, /not found/);
+});
+
+test("room sensor: learning never mixes the two sensors", () => {
+  // A warm-up whose reading switches from the unit's sensor to the room's halfway.
+  // Ten minutes apart, so each half is long enough to count on its own.
+  const s = seq([53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64], { targetF: 64 })
+    .map((x, i) => ({ ...x, t: +at(19, 2) + i * 10 * 60000, ...(i >= 6 ? { indoorSource: "room" } : {}) }));
+  assert.deepEqual(extractWarmups(s).map((r) => [r.startF, r.endF]), [[53, 58], [59, 64]], "two runs, not one 53 -> 64");
+  // ...and a switch to a sensor reading 4°F lower isn't a bad reading.
+  const switched = [{ t: +at(19, 1), indoorF: 56 }, { t: +at(19, 1, 5), indoorF: 52, indoorSource: "room" }];
+  assert.deepEqual(kept(switched), [56, 52]);
+  // Cool-downs split the same way.
+  const cool = Array.from({ length: 48 }, (_, i) => ({ t: +at(19, 8) + i * 5 * 60000, power: false, indoorF: 60 - i * 0.1, outdoorF: 30, ...(i >= 24 ? { indoorSource: "room" } : {}) }));
+  const cd = extractCooldowns(cool, { minDropF: 1, minMinutes: 60 });
+  assert.equal(cd.length, 2);
 });
 
 // --- Forecast + state parsing ----------------------------------------------------
