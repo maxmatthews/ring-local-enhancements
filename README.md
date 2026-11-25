@@ -573,7 +573,8 @@ attempt sends only what's still different, then re-reads after 30 s, 1 min,
 and after 6 the log entries become errors. While EcoNet shows the heater
 offline it waits rather than send into the void. Once confirmed it re-reads
 every 30 minutes, in case someone changed it in the app. Sign-in and network
-failures retry on the same schedule.
+failures retry on the same schedule, except when Rheem rate-limits the sign-in
+(HTTP 429). Then it waits at least 15 minutes, or longer if Rheem says to.
 
 **Unofficial API.** Rheem has no public or local API. `econet.mjs` follows
 [pyeconet](https://github.com/w1ll1am23/pyeconet), the library behind Home

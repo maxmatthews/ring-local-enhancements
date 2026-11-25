@@ -2189,6 +2189,7 @@ async function setThermostatAway(away, { returnAt } = {}) {
 const WATER_HEATER_SETTLE_MS = 3000; // between the commands of one change
 const WATER_HEATER_RECHECK_MS = 30 * 60 * 1000; // re-read a heater that's where it should be
 const WATER_HEATER_ESCALATE_AFTER = 6; // attempts before failures are logged as errors
+const WATER_HEATER_RATE_LIMIT_MS = 15 * 60 * 1000; // at least this long after a 429
 
 let econet = null;
 let waterHeaterBusy = false;
@@ -2216,7 +2217,7 @@ function setWaterHeaterSchedule(returnAt, now = new Date()) {
 function waterHeaterNoteOnce(note, asError = false) {
   if (note === waterHeaterNote) return;
   waterHeaterNote = note;
-  if (note) (asError ? logError : log)(`Water heater: ${note}`);
+  if (note) asError ? logError(`Water heater: ${note}`, "") : log(`Water heater: ${note}`);
 }
 
 function retryWaterHeaterIn(ms) {
@@ -2299,15 +2300,17 @@ async function waterHeaterTick() {
     }
     waterHeaterAttempts++;
     const msg = `${desired.reason} -- sent ${payloads.map((p) => JSON.stringify(p)).join(" then ")} (attempt ${waterHeaterAttempts}; heater reports ${state.enabled ? `on, ${state.mode?.toLowerCase().replace(/_/g, " ")}, ${state.setpointF}°F` : "off"})`;
-    if (waterHeaterAttempts > WATER_HEATER_ESCALATE_AFTER) logError(`Water heater: still not confirmed -- ${msg}`);
+    if (waterHeaterAttempts > WATER_HEATER_ESCALATE_AFTER) logError(`Water heater: still not confirmed -- ${msg}`, "");
     else log(`Water heater: ${msg}`);
     if (problems.length) waterHeaterNoteOnce(`can't fully do it on this unit: ${problems.join("; ")}`, true);
     else waterHeaterNote = null;
     retryWaterHeaterIn(retryDelayMs(waterHeaterAttempts - 1));
   } catch (err) {
-    // Rheem's cloud, the sign-in or the network: same schedule as a dropped command.
-    waterHeaterNoteOnce(`${err.message} -- retrying`, true);
-    retryWaterHeaterIn(retryDelayMs(waterHeaterAttempts++));
+    // Rheem's cloud, the sign-in or the network: same schedule as a dropped
+    // command -- except rate-limiting, which gets a long pause.
+    const wait = err.status === 429 ? Math.max(err.retryAfterMs || 0, WATER_HEATER_RATE_LIMIT_MS) : retryDelayMs(waterHeaterAttempts++);
+    waterHeaterNoteOnce(`${err.message} -- retrying in ${Math.round(wait / 60000) || "<1"} min`, true);
+    retryWaterHeaterIn(wait);
   } finally {
     waterHeaterBusy = false;
   }

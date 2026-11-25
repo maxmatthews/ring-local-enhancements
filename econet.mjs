@@ -43,7 +43,14 @@ export function createEconetClient({ email, password, host = HOST, timeoutMs = 2
       signal: AbortSignal.timeout(timeoutMs),
     });
     const text = await res.text();
-    if (!res.ok) throw Object.assign(new Error(`EcoNet ${path.split("/").pop()} ${res.status}`), { status: res.status });
+    if (!res.ok) {
+      // 429: Rheem is rate-limiting -- the caller should back off, not retry soon.
+      const retryAfterS = parseInt(res.headers.get("retry-after") || "", 10);
+      throw Object.assign(new Error(`EcoNet ${path.split("/").pop()} ${res.status}${res.status === 429 ? " (rate-limited)" : ""}`), {
+        status: res.status,
+        retryAfterMs: Number.isFinite(retryAfterS) ? retryAfterS * 1000 : null,
+      });
+    }
     try {
       return JSON.parse(text);
     } catch (_) {
@@ -58,13 +65,14 @@ export function createEconetClient({ email, password, host = HOST, timeoutMs = 2
     accountId = j.options.account_id;
   }
 
-  // Tokens expire; one fresh sign-in on a rejection, then give up for this call.
+  // Tokens expire; one fresh sign-in on a rejection, then give up for this
+  // call. Not on a 429: signing in again would only dig the hole deeper.
   async function authed(path, body) {
     if (!token) await login();
     try {
       return await post(path, body, true);
     } catch (err) {
-      if (!(err.status >= 400 && err.status < 500)) throw err;
+      if (!(err.status >= 400 && err.status < 500) || err.status === 429) throw err;
       token = null;
       await login();
       return post(path, body, true);
