@@ -575,6 +575,8 @@ offline it waits rather than send into the void. Once confirmed it re-reads
 every 30 minutes, in case someone changed it in the app. Sign-in and network
 failures retry on the same schedule, except when Rheem rate-limits the sign-in
 (HTTP 429). Then it waits at least 15 minutes, or longer if Rheem says to.
+That pause is saved in `.thermostat-state.json`, so a restart or deploy
+doesn't sign in again early.
 
 **Unofficial API.** Rheem has no public or local API. `econet.mjs` follows
 [pyeconet](https://github.com/w1ll1am23/pyeconet), the library behind Home
@@ -606,6 +608,10 @@ Remote access over the VPNs is intended. It shows:
 - every learned warm-up run
 - an Away / I'm home switch, and while away a **Back home** date and time
 - the water heater: what it reports, and what it's being brought to
+- the water heater's breaker (`LEVITON_WATER_HEATER_BREAKER_NAME`, default
+  "Water Heater"): its last hour on the tile, and hourly kWh off-peak vs
+  peak with costs, like the heat pump's. Same Leviton calls, so no extra
+  requests, and read-only like the heat pump's breaker.
 
 It refreshes every minute. Its data comes from `GET /thermostat/status` and
 `GET /thermostat/history?hours=N`.

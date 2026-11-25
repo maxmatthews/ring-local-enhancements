@@ -204,6 +204,8 @@ const WATER_HEATER_OPTS = {
 const LEVITON_EMAIL = process.env.LEVITON_EMAIL;
 const LEVITON_PASSWORD = process.env.LEVITON_PASSWORD;
 const LEVITON_BREAKER_NAME = process.env.LEVITON_BREAKER_NAME || "Heat Pump";
+// The water heater's breaker, also read-only and for the dashboard. Blank = not shown.
+const LEVITON_WATER_HEATER_BREAKER_NAME = (process.env.LEVITON_WATER_HEATER_BREAKER_NAME ?? "Water Heater").trim();
 // National Grid prices for the dashboard's cost figures, fetched once a day.
 // Load zone 2 = Central; SC1V goes to the API as class SC1 plus its description.
 const NGRID_RATES_ENABLED = (process.env.NGRID_RATES_ENABLED || "true").toLowerCase() !== "false";
@@ -2201,6 +2203,21 @@ let waterHeaterRetryAt = 0; // the next attempt isn't due before this
 let waterHeaterLast = null; // { at, state } as last reported
 let waterHeaterNote = null; // last problem, for the dashboard and to log once
 
+// A rate-limit pause is persisted: a restart (every deploy) must not sign in
+// again straight away, or Rheem's limit never clears.
+function waterHeaterPausedUntil() {
+  const t = Date.parse(thermostatState.waterHeater?.pausedUntil ?? "");
+  return Number.isFinite(t) ? t : 0;
+}
+
+function setWaterHeaterPause(untilMs) {
+  const wh = { ...(thermostatState.waterHeater || {}) };
+  if (untilMs) wh.pausedUntil = new Date(untilMs).toISOString();
+  else delete wh.pausedUntil;
+  thermostatState = { ...thermostatState, waterHeater: wh };
+  saveThermostatState();
+}
+
 function waterHeaterSchedulePersisted() {
   const sch = thermostatState.waterHeater?.schedule;
   return sch ? { onAt: new Date(sch.onAt), dropAt: new Date(sch.dropAt) } : null;
@@ -2210,7 +2227,7 @@ function waterHeaterSchedulePersisted() {
 function setWaterHeaterSchedule(returnAt, now = new Date()) {
   if (!waterHeaterEnabled) return;
   const sch = returnAt ? waterHeaterSchedule(returnAt, now, WATER_HEATER_OPTS) : null;
-  thermostatState = { ...thermostatState, waterHeater: { schedule: sch ? { onAt: sch.onAt.toISOString(), dropAt: sch.dropAt.toISOString() } : null } };
+  thermostatState = { ...thermostatState, waterHeater: { ...(thermostatState.waterHeater || {}), schedule: sch ? { onAt: sch.onAt.toISOString(), dropAt: sch.dropAt.toISOString() } : null } };
   if (sch) log(`Water heater: on at ${WATER_HEATER_OPTS.boostF}°F ${sch.onAt.toLocaleString()}, ${WATER_HEATER_OPTS.normalF}°F from ${sch.dropAt.toLocaleString()}`);
 }
 
@@ -2266,10 +2283,20 @@ async function waterHeaterTick() {
     }
     // Mid-retry: give the last attempt its full wait before looking again.
     if (+now < waterHeaterRetryAt - 1000) return;
+    // Rate-limited, possibly before a restart: no EcoNet call until it's over.
+    const paused = waterHeaterPausedUntil();
+    if (+now < paused) {
+      retryWaterHeaterIn(paused - +now);
+      return;
+    }
     // Already confirmed: only an occasional look, in case someone changed it in the app.
     if (waterHeaterAttempts === 0 && waterHeaterCheckedAt && +now - waterHeaterCheckedAt < WATER_HEATER_RECHECK_MS) return;
 
     const equip = await findWaterHeater();
+    if (waterHeaterPausedUntil()) {
+      setWaterHeaterPause(0);
+      log("Water heater: EcoNet answering again after rate-limiting");
+    }
     const state = summarizeWaterHeater(equip);
     waterHeaterLast = { at: now.toISOString(), state };
     waterHeaterCheckedAt = +now;
@@ -2281,7 +2308,7 @@ async function waterHeaterTick() {
       waterHeaterAttempts = 0;
       waterHeaterNoteOnce(problems.length ? `can't fully do it on this unit: ${problems.join("; ")}` : null, !!problems.length);
       if (desired.final && !problems.length) {
-        thermostatState = { ...thermostatState, waterHeater: { schedule: null } };
+        thermostatState = { ...thermostatState, waterHeater: { ...(thermostatState.waterHeater || {}), schedule: null } };
         saveThermostatState();
         log(`Water heater: back to everyday ${desired.setpointF}°F -- return schedule done`);
       }
@@ -2309,6 +2336,7 @@ async function waterHeaterTick() {
     // Rheem's cloud, the sign-in or the network: same schedule as a dropped
     // command -- except rate-limiting, which gets a long pause.
     const wait = err.status === 429 ? Math.max(err.retryAfterMs || 0, WATER_HEATER_RATE_LIMIT_MS) : retryDelayMs(waterHeaterAttempts++);
+    if (err.status === 429) setWaterHeaterPause(Date.now() + wait);
     waterHeaterNoteOnce(`${err.message} -- retrying in ${Math.round(wait / 60000) || "<1"} min`, true);
     retryWaterHeaterIn(wait);
   } finally {
@@ -2333,6 +2361,7 @@ function waterHeaterStatusBody() {
     reported: waterHeaterLast,
     attempts: waterHeaterAttempts,
     note: waterHeaterNote,
+    pausedUntil: thermostatState.waterHeater?.pausedUntil ?? null,
   };
 }
 
@@ -2346,14 +2375,30 @@ const LOCAL_TZ = Intl.DateTimeFormat().resolvedOptions().timeZone;
 let leviton = null;
 let levitonBreaker = null; // normalizeBreaker() of the heat pump, plus fetchedAt
 let levitonBreakerPosition = null;
+let levitonWaterHeater = null; // ...and of the water heater's breaker
+let levitonWaterHeaterPosition = null;
+let levitonWaterHeaterMissingLogged = false;
 let levitonLiveAt = 0;
-const levitonDays = new Map(); // "YYYY-MM-DD" -> { rows, fetchedAt }
+const levitonDays = new Map(); // "YYYY-MM-DD" -> { all: {position: rows}, fetchedAt }
 
 async function refreshLevitonLive() {
   if (!leviton || Date.now() - levitonLiveAt < LEVITON_LIVE_REFRESH_MS) return;
   levitonLiveAt = Date.now();
   try {
     const breakers = await leviton.listBreakers();
+    const fetchedAt = new Date().toISOString();
+    // The water heater's breaker comes from the same listing -- no extra call.
+    if (LEVITON_WATER_HEATER_BREAKER_NAME) {
+      const w = findBreaker(breakers, LEVITON_WATER_HEATER_BREAKER_NAME);
+      if (w) {
+        if (levitonWaterHeaterPosition == null) log(`Leviton: water heater breaker "${w.name}" (position ${w.position}, ${w.poles}-pole)`);
+        levitonWaterHeaterPosition = w.position;
+        levitonWaterHeater = { ...w, fetchedAt };
+      } else if (!levitonWaterHeaterMissingLogged) {
+        levitonWaterHeaterMissingLogged = true;
+        logError(`No Leviton breaker matching "${LEVITON_WATER_HEATER_BREAKER_NAME}" for the water heater. Available: ${breakers.map((x) => x.name).join(", ")}`);
+      }
+    }
     const b = findBreaker(breakers, LEVITON_BREAKER_NAME);
     if (!b) {
       logError(`No Leviton breaker matching "${LEVITON_BREAKER_NAME}". Available: ${breakers.map((x) => x.name).join(", ")}`);
@@ -2361,29 +2406,27 @@ async function refreshLevitonLive() {
     }
     if (levitonBreakerPosition == null) log(`Leviton: heat pump breaker "${b.name}" (position ${b.position}, ${b.poles}-pole)`);
     levitonBreakerPosition = b.position;
-    levitonBreaker = { ...b, fetchedAt: new Date().toISOString() };
+    levitonBreaker = { ...b, fetchedAt };
   } catch (err) {
     logError("Leviton breaker read failed", err);
   }
 }
 
-// Hourly kWh for the heat pump on one local day. Past days are final and kept;
-// today is refetched every half hour.
+// Hourly kWh for every breaker on one local day -- the panel returns them all
+// in one call. Past days are final and kept; today is refetched every half hour.
 async function levitonDay(day) {
   const cached = levitonDays.get(day);
   const isToday = day === localDateKey(new Date());
-  if (cached && (!isToday || Date.now() - cached.fetchedAt < LEVITON_TODAY_REFRESH_MS)) return cached.rows;
-  if (levitonBreakerPosition == null) await refreshLevitonLive();
-  if (levitonBreakerPosition == null) return cached?.rows ?? [];
+  if (cached && (!isToday || Date.now() - cached.fetchedAt < LEVITON_TODAY_REFRESH_MS)) return cached.all;
   const all = await leviton.hourlyEnergy(day, LOCAL_TZ);
-  const rows = all[String(levitonBreakerPosition)] || [];
-  levitonDays.set(day, { rows, fetchedAt: Date.now() });
+  levitonDays.set(day, { all, fetchedAt: Date.now() });
   for (const key of levitonDays.keys()) if (levitonDays.size > LEVITON_MAX_DAYS + 2 && key < day) levitonDays.delete(key);
-  return rows;
+  return all;
 }
 
-async function heatPumpEnergy(fromMs, toMs) {
-  if (!leviton) return [];
+/** One breaker's hourly kWh rows over [fromMs, toMs]. */
+async function breakerEnergy(position, fromMs, toMs) {
+  if (!leviton || position == null) return [];
   const days = [];
   for (let d = new Date(fromMs); d <= new Date(toMs); d = new Date(d.getFullYear(), d.getMonth(), d.getDate() + 1)) {
     days.push(localDateKey(d));
@@ -2391,12 +2434,23 @@ async function heatPumpEnergy(fromMs, toMs) {
   const out = [];
   for (const day of days) {
     try {
-      out.push(...(await levitonDay(day)));
+      out.push(...((await levitonDay(day))[String(position)] || []));
     } catch (err) {
       logError(`Leviton energy for ${day} failed`, err);
     }
   }
   return out;
+}
+
+async function heatPumpEnergy(fromMs, toMs) {
+  if (levitonBreakerPosition == null) await refreshLevitonLive();
+  return breakerEnergy(levitonBreakerPosition, fromMs, toMs);
+}
+
+async function waterHeaterEnergy(fromMs, toMs) {
+  if (!LEVITON_WATER_HEATER_BREAKER_NAME) return null;
+  if (levitonWaterHeaterPosition == null) await refreshLevitonLive();
+  return levitonWaterHeaterPosition == null ? null : breakerEnergy(levitonWaterHeaterPosition, fromMs, toMs);
 }
 
 // --- National Grid prices (dashboard only) -------------------------------------
@@ -2536,6 +2590,9 @@ async function thermostatHistoryBody(hours) {
     to: new Date(toMs).toISOString(),
     samples: downsample(samples),
     energy: priceEnergy(await heatPumpEnergy(fromMs, toMs)),
+    // null = no water heater breaker configured or found.
+    waterHeaterEnergy: await waterHeaterEnergy(fromMs, toMs).then((rows) => (rows ? priceEnergy(rows) : null)),
+    waterHeaterBreaker: levitonWaterHeater,
     rates: ngridStatus(),
     breaker: levitonBreaker,
     levitonEnabled,
@@ -2574,6 +2631,7 @@ function thermostatStatusBody() {
     learnedRuns: extractWarmups(trustedSamples(thermostatHistory)).slice(-20),
     samples: thermostatHistory.length,
     breaker: levitonBreaker,
+    waterHeaterBreaker: levitonWaterHeater,
     rates: ngridStatus(),
     waterHeater: waterHeaterStatusBody(),
     window: (() => {

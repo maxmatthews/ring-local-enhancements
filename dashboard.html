@@ -213,7 +213,9 @@ function render() {
     breakerTile(status.breaker),
     status.waterHeater?.enabled ? waterHeaterTile(status.waterHeater) : null);
 
-  app.replaceChildren(header, tiles, planCard(), tempCard(), energyCard(), runsCard());
+  app.replaceChildren(...[header, tiles, planCard(), tempCard(), energyCard(),
+    history?.waterHeaterEnergy ? energyCard("Water heater energy per hour (kWh)", history.waterHeaterEnergy, { ratesNote: false }) : null,
+    runsCard()].filter(Boolean));
 }
 
 // The room sensor when it's in use (to a tenth), with the unit's own reading beside it.
@@ -263,7 +265,10 @@ function waterHeaterTile(wh) {
   else sub = r?.enabled ? pretty(r.mode) : r ? "Off while away" : "Not read yet";
   const pill = !r ? null : !r.connected ? statusPill("var(--critical)", "Offline")
     : wh.note ? statusPill("var(--warn)", "Retrying") : statusPill(r.enabled ? "var(--good)" : "var(--text-3)", r.enabled ? "On" : "Off");
-  return tile("Water heater", value, wh.note ? `${sub} · ${wh.note}` : sub, pill);
+  const now = Date.now();
+  const lastHour = (history?.waterHeaterEnergy || []).map((x) => ({ ...x, t: hourStart(x) })).filter((x) => x.t + 3600000 <= now).pop();
+  const breaker = lastHour ? el("div", { class: "sub" }, `Breaker ${lastHour.kWh.toFixed(2)} kWh, ${fmtTime(new Date(lastHour.t))}–${fmtTime(new Date(lastHour.t + 3600000))}`) : null;
+  return tile("Water heater", value, wh.note ? `${sub} · ${wh.note}` : sub, el("div", {}, pill, breaker));
 }
 
 // Leads with the last complete hour from Leviton's energy history: that's
@@ -609,15 +614,17 @@ function inOffPeak(t) {
   return offPeakSpans(t - 86400000, t + 86400000).some(([a, b]) => t >= a && t < b);
 }
 
-function energyCard() {
-  const card = el("div", { class: "card" }, el("h2", {}, "Heat pump energy per hour (kWh)"));
+// Hourly kWh from a Leviton breaker, off-peak vs peak, priced. The heat pump's
+// by default; the water heater's card passes its own rows and skips the rates note.
+function energyCard(title = "Heat pump energy per hour (kWh)", source = history?.energy, { ratesNote = true } = {}) {
+  const card = el("div", { class: "card" }, el("h2", {}, title));
   if (history?.levitonEnabled === false) {
     card.append(el("p", { class: "muted" }, "Leviton isn't configured (LEVITON_EMAIL / LEVITON_PASSWORD on the Pi)."));
     return card;
   }
   const { from, to } = rangeBounds();
   const now = Date.now();
-  const rows = (history?.energy || []).map((r) => ({ ...r, t: hourStart(r) })).filter((r) => r.t + 3600000 > from && r.t <= now);
+  const rows = (source || []).map((r) => ({ ...r, t: hourStart(r) })).filter((r) => r.t + 3600000 > from && r.t <= now);
   if (!rows.length) {
     card.append(el("p", { class: "muted" }, "No energy data from the Leviton panel yet."));
     return card;
@@ -693,7 +700,9 @@ function energyCard() {
   totals.append(el("div", {}, el("strong", {}, `${sum(() => true).toFixed(1)} kWh`), "Shown range", el("span", { class: "muted" }, ` · $${sumCost(() => true).toFixed(2)}`)));
   card.append(totals);
   const rt = history?.rates;
-  if (rt?.totals) {
+  if (!ratesNote) {
+    // the heat pump card already explains the prices
+  } else if (rt?.totals) {
     const day = rt.supplyDay ? new Date(`${rt.supplyDay}T12:00`) : null;
     card.append(el("p", { class: "muted", style: "margin:10px 0 0" },
       `National Grid ${rt.serviceClass}: off-peak ${cents(rt.totals.offPeak)}, on-peak ${cents(rt.totals.onPeak)}` +
